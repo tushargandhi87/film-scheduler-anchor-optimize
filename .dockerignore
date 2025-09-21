@@ -1,0 +1,26 @@
+Git
+.git
+.gitignore
+
+Python virtual environment
+.venv
+venv/
+env/
+
+Python cache
+pycache/
+*.pyc
+*.pyo
+*.pyd
+
+IDE and editor directories
+.vscode/
+.idea/
+
+Environment variables
+.env*
+
+Build artifacts
+build/
+dist/
+*.egg-info/
