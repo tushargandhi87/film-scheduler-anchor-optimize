@@ -129,12 +129,13 @@ class NaiveScheduler:
     """
     A simple scheduler that first places anchors and then fills the gaps.
     """
-    def __init__(self, clusters: List[LocationCluster], calendar: ShootingCalendar, parser: StructuredConstraintParser):
+    def __init__(self, clusters: List[LocationCluster], calendar: ShootingCalendar, parser: StructuredConstraintParser, scene_time_estimates: Dict[str, float]):
         self.clusters = clusters
         self.calendar = calendar
         self.parser = parser
         self.schedule: Dict[date, Dict] = {day: {"scenes": [], "location": None} for day in self.calendar.shooting_days}
         self.unplaced_anchors = []
+        self.scene_time_estimates = scene_time_estimates
 
     def build_schedule(self) -> List[Dict[str, Any]]:
         """Main method to construct the naïve schedule."""
@@ -192,8 +193,8 @@ class NaiveScheduler:
                 scenes_for_this_day = []
                 while scenes_to_schedule:
                     scene = scenes_to_schedule[0]
-                    # This is a simplified time estimate for now; we'll refine this later
-                    scene_hours = self.parser.scene_time_estimates.get(str(scene.get('Scene_Number')), 1.0)
+                    # CORRECTED: Now uses the time estimates passed directly to the scheduler.
+                    scene_hours = self.scene_time_estimates.get(str(scene.get('Scene_Number')), 1.0)
                     
                     if day_hours + scene_hours <= MAX_DAILY_HOURS:
                         scenes_for_this_day.append(scenes_to_schedule.pop(0))
@@ -266,7 +267,8 @@ async def run_iteration_2(request: ScheduleRequest):
         parser = StructuredConstraintParser(request.constraints)
         cluster_manager = LocationClusterManager(request.stripboard, request.constraints)
         
-        scheduler = NaiveScheduler(cluster_manager.clusters, calendar, parser)
+        # CORRECTED: Pass the parsed scene_time_estimates from the cluster_manager to the scheduler.
+        scheduler = NaiveScheduler(cluster_manager.clusters, calendar, parser, cluster_manager.scene_time_estimates)
         final_schedule = scheduler.build_schedule()
         
         return Iteration2Response(
@@ -289,5 +291,6 @@ async def health_check():
 if __name__ == "__main__":
     print("INFO: Starting FastAPI server for Iteration 2...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
