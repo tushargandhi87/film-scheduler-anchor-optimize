@@ -46,8 +46,9 @@ class NonNegotiableConstraint:
     """Represents a single, immovable scheduling anchor."""
     constraint_type: str # e.g., 'actor_hard_out', 'location_permit'
     identifier: str # e.g., 'Morgan Freeman', 'University Hospital'
-    date: date
+    date: Optional[date] # Can be None for relative constraints like 'shoot_first'
     scenes_affected: List[str] = field(default_factory=list)
+    details: Dict[str, Any] = field(default_factory=dict) # To store extra info
 
 
 # --- 3. Helper Classes (New for Iteration 2) ---
@@ -100,25 +101,63 @@ class StructuredConstraintParser:
         except (KeyError, TypeError, ValueError) as e:
             print(f"WARNING: Could not parse actor constraints: {e}")
 
-        # --- Fixed-Date Location Permits ---
+        # --- Fixed-Date Location Permits (Handles single and multi-day) ---
         try:
             locations = self.raw_constraints.get('location_constraints', {}).get('locations', {})
             for loc_name, details in locations.items():
                 for constraint in details.get('constraints', []):
-                    # CORRECTED: Now looks for the exact "Non-negotiable" string.
                     if (constraint.get('constraint_type') == 'availability_window' and 
-                        constraint.get('constraint_level') == 'Non-negotiable' and
-                        constraint['parsed_data'].get('start_date') == constraint['parsed_data'].get('end_date')):
+                        constraint.get('constraint_level') == 'Non-negotiable'):
                         
-                        date_str = constraint['parsed_data']['start_date']
-                        anchors.append(NonNegotiableConstraint(
-                            constraint_type='location_permit',
-                            identifier=details.get('real_address', loc_name),
-                            date=datetime.strptime(date_str, "%Y-%m-%d").date(),
-                            scenes_affected=details.get('scenes', [])
-                        ))
+                        parsed_data = constraint['parsed_data']
+                        start_date_str = parsed_data.get('start_date')
+                        end_date_str = parsed_data.get('end_date')
+
+                        if start_date_str and end_date_str:
+                            start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+                            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+                            
+                            # Create an anchor for each day in the non-negotiable range
+                            current_date = start_date
+                            while current_date <= end_date:
+                                anchors.append(NonNegotiableConstraint(
+                                    constraint_type='location_permit',
+                                    identifier=details.get('real_address', loc_name),
+                                    date=current_date,
+                                    scenes_affected=details.get('scenes', [])
+                                ))
+                                current_date += timedelta(days=1)
+
         except (KeyError, TypeError, ValueError) as e:
             print(f"WARNING: Could not parse location constraints: {e}")
+
+        # --- Director & DOP Notes ---
+        try:
+            creative = self.raw_constraints.get('creative_constraints', {})
+            # Director Notes
+            director_notes = creative.get('director_notes', {}).get('director_constraints', [])
+            for note in director_notes:
+                if note.get('constraint_level') == 'Non-negotiable':
+                    anchors.append(NonNegotiableConstraint(
+                        constraint_type=f"director_{note.get('constraint_type')}",
+                        identifier=note.get('constraint_text', 'Director Note'),
+                        date=None, # Relative to schedule, not a fixed date
+                        scenes_affected=note.get('related_scenes', []),
+                        details=note
+                    ))
+            # DOP Priorities
+            dop_notes = creative.get('dop_priorities', {}).get('dop_priorities', [])
+            for note in dop_notes:
+                if note.get('constraint_level') == 'Non-negotiable':
+                    anchors.append(NonNegotiableConstraint(
+                        constraint_type=f"dop_{note.get('category', 'priority')}",
+                        identifier=note.get('constraint_text', 'DOP Note'),
+                        date=None,
+                        scenes_affected=note.get('related_scenes', []),
+                        details=note
+                    ))
+        except (KeyError, TypeError) as e:
+            print(f"WARNING: Could not parse creative constraints: {e}")
             
         return anchors
 
@@ -146,24 +185,76 @@ class NaiveScheduler:
     def _place_anchors(self):
         """Places non-negotiable scenes on their mandatory dates."""
         print("INFO: Placing non-negotiable anchors on the calendar...")
-        for anchor in self.parser.non_negotiables:
-            if anchor.date in self.schedule:
-                if self.schedule[anchor.date]['location'] is not None:
-                    print(f"WARNING: Date {anchor.date} is already booked. Cannot place anchor for {anchor.identifier}.")
-                    self.unplaced_anchors.append(vars(anchor))
-                    continue
+        
+        # Sort anchors to handle fixed dates first, then relative ones
+        sorted_anchors = sorted(self.parser.non_negotiables, key=lambda x: x.date is None)
 
-                if anchor.constraint_type == 'location_permit':
-                    # Find the corresponding cluster and place all its scenes on the day
-                    found_cluster = next((c for c in self.clusters if c.location == anchor.identifier), None)
-                    if found_cluster:
-                        self.schedule[anchor.date]['scenes'].extend(found_cluster.scenes)
-                        self.schedule[anchor.date]['location'] = found_cluster.location
-                        # Remove the cluster as it's now fully scheduled
-                        self.clusters.remove(found_cluster)
-                    else:
-                        print(f"WARNING: Could not find cluster for anchor location {anchor.identifier}")
+        for anchor in sorted_anchors:
+            # --- Handle Fixed-Date Anchors ---
+            if anchor.date:
+                if anchor.date in self.schedule:
+                    if self.schedule[anchor.date]['location'] is not None:
+                        print(f"WARNING: Date {anchor.date} is already booked. Cannot place anchor for {anchor.identifier}.")
                         self.unplaced_anchors.append(vars(anchor))
+                        continue
+
+                    if anchor.constraint_type == 'location_permit':
+                        found_cluster = next((c for c in self.clusters if c.location == anchor.identifier), None)
+                        if found_cluster:
+                            self.schedule[anchor.date]['scenes'].extend(found_cluster.scenes)
+                            self.schedule[anchor.date]['location'] = found_cluster.location
+                            self.clusters.remove(found_cluster)
+                        else:
+                            print(f"WARNING: Could not find cluster for anchor location {anchor.identifier}")
+                            self.unplaced_anchors.append(vars(anchor))
+            
+            # --- Handle Relative Anchors (e.g., Shoot First/Last) ---
+            else:
+                if anchor.constraint_type == 'director_shoot_first':
+                    self._place_relative_anchor(anchor, position='first')
+                elif anchor.constraint_type == 'director_shoot_last':
+                    self._place_relative_anchor(anchor, position='last')
+                elif anchor.constraint_type == 'director_same_day_grouping':
+                    self._place_relative_anchor(anchor, position='first') # Place same-day groups early by default
+
+    def _place_relative_anchor(self, anchor: NonNegotiableConstraint, position: str):
+        """Places scenes for relative anchors like 'shoot_first' or 'shoot_last'."""
+        day_to_schedule = None
+        if position == 'first':
+            # Find the first available day
+            for day in self.calendar.shooting_days:
+                if self.schedule[day]['location'] is None:
+                    day_to_schedule = day
+                    break
+        elif position == 'last':
+            # Find the last available day
+            for day in reversed(self.calendar.shooting_days):
+                if self.schedule[day]['location'] is None:
+                    day_to_schedule = day
+                    break
+
+        if day_to_schedule:
+            scenes_to_place = []
+            location = None
+            for scene_num in anchor.scenes_affected:
+                for cluster in self.clusters:
+                    scene_data = next((s for s in cluster.scenes if str(s.get('Scene_Number')) == str(scene_num)), None)
+                    if scene_data:
+                        scenes_to_place.append(scene_data)
+                        location = cluster.location
+                        # Remove the scene so it's not scheduled again
+                        cluster.scenes.remove(scene_data)
+                        break
+            
+            if scenes_to_place:
+                self.schedule[day_to_schedule]['scenes'].extend(scenes_to_place)
+                self.schedule[day_to_schedule]['location'] = location
+            else:
+                print(f"WARNING: Could not find scenes for relative anchor: {anchor.identifier}")
+                self.unplaced_anchors.append(vars(anchor))
+        else:
+            print(f"WARNING: No available days to place relative anchor: {anchor.identifier}")
+            self.unplaced_anchors.append(vars(anchor))
 
     def _fill_remaining_days(self):
         """Fills empty calendar slots with the remaining location clusters."""
@@ -291,6 +382,7 @@ async def health_check():
 if __name__ == "__main__":
     print("INFO: Starting FastAPI server for Iteration 2...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 
 
