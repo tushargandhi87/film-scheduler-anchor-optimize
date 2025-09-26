@@ -348,46 +348,46 @@ class LocationClusterManager:
 class ProductionScheduler:
     """Main scheduler class that coordinates all components"""
     
-    def __init__(self, input_data: List[Dict]):
-        validation_result = DataValidator.validate_input(input_data)
-        if not validation_result:
-            # Try to get more specific error information
-            try:
-                if not isinstance(input_data, list) or len(input_data) != 1:
-                    raise ValueError("Input must be an array with exactly one object")
-                
-                production_data = input_data[0]
-                required_keys = ['stripboard', 'constraints', 'ga_params']
-                
-                for key in required_keys:
-                    if key not in production_data:
-                        raise ValueError(f"Missing required top-level key: {key}")
-                
-                stripboard = production_data['stripboard']
-                if not isinstance(stripboard, list):
-                    raise ValueError("Stripboard must be an array")
-                
-                if len(stripboard) == 0:
-                    raise ValueError("Stripboard cannot be empty")
-                
-                required_scene_fields = [
-                    'Scene_Number', 'INT_EXT', 'Location_Name', 'Day_Night',
-                    'Synopsis', 'Page_Count', 'Script_Day', 'Cast', 'Geographic_Location'
-                ]
-                
-                for i, scene in enumerate(stripboard):
-                    scene_id = scene.get('Scene_Number', f'Scene_{i+1}')
-                    for field in required_scene_fields:
-                        if field not in scene:
-                            raise ValueError(f"Scene {scene_id} missing required field: {field}")
-                
-                # If we get here, validation should have passed, so there's an unknown error
-                raise ValueError("Unknown validation error - all checks passed but validator returned False")
-                
-            except Exception as detailed_error:
-                raise ValueError(f"Detailed validation error: {str(detailed_error)}")
+    def __init__(self, input_data):
+        # Handle both array format [{}] and direct object format {}
+        if isinstance(input_data, list):
+            if len(input_data) != 1:
+                raise ValueError(f"If array format, input must contain exactly one object, got {len(input_data)}")
+            production_data = input_data[0]
+        elif isinstance(input_data, dict):
+            production_data = input_data
+        else:
+            raise ValueError(f"Input must be either an array with one object or a single object, got {type(input_data)}")
         
-        self.production_data = input_data[0]
+        # Validate required keys
+        required_keys = ['stripboard', 'constraints', 'ga_params']
+        for key in required_keys:
+            if key not in production_data:
+                raise ValueError(f"Missing required key: {key}")
+        
+        # Validate stripboard structure
+        stripboard = production_data['stripboard']
+        if not isinstance(stripboard, list):
+            raise ValueError("Stripboard must be an array")
+        
+        if len(stripboard) == 0:
+            raise ValueError("Stripboard cannot be empty")
+        
+        # Validate required scene fields
+        required_scene_fields = [
+            'Scene_Number', 'INT_EXT', 'Location_Name', 'Day_Night',
+            'Synopsis', 'Page_Count', 'Script_Day', 'Cast', 'Geographic_Location'
+        ]
+        
+        for i, scene in enumerate(stripboard):
+            scene_id = scene.get('Scene_Number', f'Scene_{i+1}')
+            for field in required_scene_fields:
+                if field not in scene:
+                    raise ValueError(f"Scene {scene_id} missing required field: {field}")
+        
+        logger.info(f"Data validation successful: {len(stripboard)} scenes loaded")
+        
+        self.production_data = production_data
         self.stripboard = self.production_data['stripboard']
         self.constraints = self.production_data['constraints']
         self.ga_params = self.production_data['ga_params']
