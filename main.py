@@ -349,8 +349,43 @@ class ProductionScheduler:
     """Main scheduler class that coordinates all components"""
     
     def __init__(self, input_data: List[Dict]):
-        if not DataValidator.validate_input(input_data):
-            raise ValueError("Input data validation failed")
+        validation_result = DataValidator.validate_input(input_data)
+        if not validation_result:
+            # Try to get more specific error information
+            try:
+                if not isinstance(input_data, list) or len(input_data) != 1:
+                    raise ValueError("Input must be an array with exactly one object")
+                
+                production_data = input_data[0]
+                required_keys = ['stripboard', 'constraints', 'ga_params']
+                
+                for key in required_keys:
+                    if key not in production_data:
+                        raise ValueError(f"Missing required top-level key: {key}")
+                
+                stripboard = production_data['stripboard']
+                if not isinstance(stripboard, list):
+                    raise ValueError("Stripboard must be an array")
+                
+                if len(stripboard) == 0:
+                    raise ValueError("Stripboard cannot be empty")
+                
+                required_scene_fields = [
+                    'Scene_Number', 'INT_EXT', 'Location_Name', 'Day_Night',
+                    'Synopsis', 'Page_Count', 'Script_Day', 'Cast', 'Geographic_Location'
+                ]
+                
+                for i, scene in enumerate(stripboard):
+                    scene_id = scene.get('Scene_Number', f'Scene_{i+1}')
+                    for field in required_scene_fields:
+                        if field not in scene:
+                            raise ValueError(f"Scene {scene_id} missing required field: {field}")
+                
+                # If we get here, validation should have passed, so there's an unknown error
+                raise ValueError("Unknown validation error - all checks passed but validator returned False")
+                
+            except Exception as detailed_error:
+                raise ValueError(f"Detailed validation error: {str(detailed_error)}")
         
         self.production_data = input_data[0]
         self.stripboard = self.production_data['stripboard']
@@ -471,7 +506,10 @@ async def create_schedule(request: Request):
         body = await request.json()
         
         logger.info("Received scheduling request")
-        logger.info(f"Input data size: {len(body)} objects")
+        logger.info(f"Raw body type: {type(body)}")
+        logger.info(f"Raw body length (if list): {len(body) if isinstance(body, list) else 'N/A - not a list'}")
+        logger.info(f"Raw body keys (if dict): {list(body.keys()) if isinstance(body, dict) else 'N/A - not a dict'}")
+        logger.info(f"First 200 chars of body: {str(body)[:200]}...")
         
         # Initialize scheduler with the input data
         scheduler = ProductionScheduler(body)
