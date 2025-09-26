@@ -448,19 +448,22 @@ async def health_check():
     }
 
 @app.post("/schedule", response_model=ScheduleResponse)
-async def create_schedule(request: List[Dict[str, Any]]):
+async def create_schedule(request: Request):
     """
     Main endpoint to process film production scheduling
-    Expects JSON payload matching the http_request.schema.json structure (array directly)
+    Expects JSON array matching the http_request.schema.json structure
     """
     start_time = datetime.now()
     
     try:
+        # Parse raw JSON body
+        body = await request.json()
+        
         logger.info("Received scheduling request")
-        logger.info(f"Input data size: {len(request)} objects")
+        logger.info(f"Input data size: {len(body)} objects")
         
         # Initialize scheduler with the input data
-        scheduler = ProductionScheduler(request)
+        scheduler = ProductionScheduler(body)
         
         # Process Iteration 1
         results = scheduler.process_iteration_1()
