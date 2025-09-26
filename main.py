@@ -67,6 +67,8 @@ class DataValidator:
     def validate_input(data: Any) -> bool:
         """Validate the input data structure matches expected schema"""
         try:
+            logger.info("Starting data validation...")
+            
             if not isinstance(data, list) or len(data) != 1:
                 raise ValueError("Input must be an array with exactly one object")
             
@@ -77,6 +79,8 @@ class DataValidator:
                 if key not in production_data:
                     raise ValueError(f"Missing required key: {key}")
             
+            logger.info("Top-level keys validated successfully")
+            
             # Validate stripboard structure
             stripboard = production_data['stripboard']
             if not isinstance(stripboard, list):
@@ -86,22 +90,29 @@ class DataValidator:
             if len(stripboard) == 0:
                 raise ValueError("Stripboard cannot be empty")
             
+            logger.info(f"Stripboard structure validated: {len(stripboard)} scenes found")
+            
             # Validate required scene fields
             required_scene_fields = [
                 'Scene_Number', 'INT_EXT', 'Location_Name', 'Day_Night',
                 'Synopsis', 'Page_Count', 'Script_Day', 'Cast', 'Geographic_Location'
             ]
             
-            for scene in stripboard:
+            for i, scene in enumerate(stripboard):
+                logger.info(f"Validating scene {i+1}: {scene.get('Scene_Number', 'UNKNOWN')}")
                 for field in required_scene_fields:
                     if field not in scene:
-                        raise ValueError(f"Scene missing required field: {field}")
+                        raise ValueError(f"Scene {scene.get('Scene_Number', i+1)} missing required field: {field}")
             
+            logger.info(f"All scene fields validated successfully")
             logger.info(f"Data validation successful: {len(stripboard)} scenes loaded")
             return True
             
         except Exception as e:
-            logger.error(f"Data validation failed: {str(e)}")
+            logger.error(f"Data validation failed with exception: {str(e)}")
+            logger.error(f"Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
 
 class DateAnchorExtractor:
