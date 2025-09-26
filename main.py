@@ -419,10 +419,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-class ScheduleRequest(BaseModel):
-    """Pydantic model for the incoming schedule request"""
-    data: List[Dict[str, Any]]
-
 class ScheduleResponse(BaseModel):
     """Pydantic model for the schedule response"""
     success: bool
@@ -452,19 +448,19 @@ async def health_check():
     }
 
 @app.post("/schedule", response_model=ScheduleResponse)
-async def create_schedule(request: ScheduleRequest):
+async def create_schedule(request: List[Dict[str, Any]]):
     """
     Main endpoint to process film production scheduling
-    Expects JSON payload matching the http_request.schema.json structure
+    Expects JSON payload matching the http_request.schema.json structure (array directly)
     """
     start_time = datetime.now()
     
     try:
         logger.info("Received scheduling request")
-        logger.info(f"Input data size: {len(request.data)} objects")
+        logger.info(f"Input data size: {len(request)} objects")
         
         # Initialize scheduler with the input data
-        scheduler = ProductionScheduler(request.data)
+        scheduler = ProductionScheduler(request)
         
         # Process Iteration 1
         results = scheduler.process_iteration_1()
