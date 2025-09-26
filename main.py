@@ -1,323 +1,577 @@
 """
-Film Production Schedule Optimizer - Iteration 2
-Goal: The "Naïve" Scheduler (Anchors & Sequential Fill)
-This script builds upon Iteration 1 by introducing a basic scheduler that
-respects non-negotiable constraints. It first places "anchor" scenes on their
-mandatory dates and then fills the remaining schedule sequentially.
+Film Production Scheduling Optimizer - Iteration 1
+Foundational Data Loading & Location Clustering
+
+This iteration implements:
+1. JSON data validation and ingestion
+2. Date-specific non-negotiable constraint anchoring
+3. LocationClusterManager for geographic scene clustering
+4. Shooting time calculation per location cluster
+5. FastAPI web service for deployment on Railway
 """
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass
 from collections import defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, date
+import logging
 import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
+import traceback
 
-# --- 1. API and Data Models (Updated for Iteration 2) ---
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Film Schedule Optimizer - Iteration 2",
-    description="Implements a basic scheduler that handles non-negotiable constraints."
-)
+@dataclass
+class SceneInfo:
+    """Data structure for individual scene information"""
+    scene_number: str
+    int_ext: str
+    location_name: str
+    day_night: str
+    synopsis: str
+    page_count: str
+    script_day: str
+    cast: List[str]
+    geographic_location: str
+    estimated_time_hours: float = 0.0
+    complexity_tier: str = ""
 
-class ScheduleRequest(BaseModel):
-    stripboard: List[Dict[str, Any]]
-    constraints: Dict[str, Any]
-    ga_params: Optional[Dict[str, Any]] = {}
-
-class Iteration2Response(BaseModel):
-    message: str
-    total_shooting_days: int
-    schedule: List[Dict[str, Any]]
-    unplaced_anchors: List[Dict[str, Any]]
-
-# --- 2. Core Data Structures (Updated for Iteration 2) ---
+@dataclass
+class DateAnchor:
+    """Data structure for date-specific non-negotiable constraints"""
+    constraint_type: str  # 'actor_departure', 'location_permit', 'equipment_return'
+    entity_name: str      # Actor name, location name, etc.
+    anchor_date: datetime
+    constraint_details: str
+    affected_scenes: List[str] = None
 
 @dataclass
 class LocationCluster:
-    location: str
-    scenes: List[Dict]
-    total_hours: float
-    required_actors: List[str]
+    """Data structure for geographic location clusters"""
+    geographic_location: str
+    scenes: List[SceneInfo]
+    total_shooting_hours: float
+    total_shooting_days: int
+    complexity_distribution: Dict[str, int]
+    cast_requirements: set
 
-@dataclass
-class NonNegotiableConstraint:
-    """Represents a single, immovable scheduling anchor."""
-    constraint_type: str
-    identifier: str
-    date: Optional[date] = None
-    scenes_affected: List[str] = field(default_factory=list)
-    details: Dict[str, Any] = field(default_factory=dict)
-
-
-# --- 3. Helper Classes (Updated for Iteration 2) ---
-
-class ShootingCalendar:
-    """Manages the available shooting days for the production."""
-    def __init__(self, start_date_str: str, end_date_str: str):
-        self.start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-        self.end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-        self.shooting_days = self._generate_shooting_days()
-        print(f"INFO: Calendar created with {len(self.shooting_days)} available shooting days.")
-
-    def _generate_shooting_days(self) -> List[date]:
-        days = []
-        current_day = self.start_date
-        while current_day <= self.end_date:
-            if current_day.weekday() != 6: # 6 = Sunday
-                days.append(current_day)
-            current_day += timedelta(days=1)
-        return days
-
-class StructuredConstraintParser:
-    """
-    Parses raw constraints, focusing on "Non-Negotiable" anchors.
-    """
-    def __init__(self, constraints: Dict[str, Any]):
-        self.raw_constraints = constraints
-        self.non_negotiables = self._parse_non_negotiables()
-        print(f"INFO: Parser found {len(self.non_negotiables)} non-negotiable constraints.")
-
-    def _parse_non_negotiables(self) -> List[NonNegotiableConstraint]:
-        anchors = []
-        anchors.extend(self._parse_actor_anchors())
-        anchors.extend(self._parse_location_anchors())
-        anchors.extend(self._parse_creative_anchors())
-        return anchors
-
-    def _parse_actor_anchors(self) -> List[NonNegotiableConstraint]:
-        # Implementation for parsing actor hard-outs
-        # ... (This logic was correct and remains the same)
-        return []
-
-    def _parse_location_anchors(self) -> List[NonNegotiableConstraint]:
-        anchors = []
-        try:
-            locations = self.raw_constraints.get('location_constraints', {}).get('locations', {})
-            for loc_name, details in locations.items():
-                real_address = details.get('real_address', loc_name)
-                for constraint in details.get('constraints', []):
-                    if constraint.get('constraint_level') == 'Non-negotiable':
-                        # Handle fixed date ranges
-                        if constraint.get('constraint_type') == 'availability_window':
-                            parsed_data = constraint['parsed_data']
-                            start_date = datetime.strptime(parsed_data['start_date'], "%Y-%m-%d").date()
-                            end_date = datetime.strptime(parsed_data['end_date'], "%Y-%m-%d").date()
-                            anchors.append(NonNegotiableConstraint(
-                                constraint_type='location_date_range',
-                                identifier=real_address,
-                                details={'start': start_date, 'end': end_date, 'scenes': details.get('scenes', [])}
-                            ))
-                        # Handle day-of-week restrictions
-                        elif constraint.get('constraint_type') == 'day_restriction':
-                            parsed_data = constraint['parsed_data']
-                            anchors.append(NonNegotiableConstraint(
-                                constraint_type='location_day_of_week',
-                                identifier=real_address,
-                                details={'allowed_days': parsed_data.get('day_restrictions', []), 'scenes': details.get('scenes', [])}
-                            ))
-        except (KeyError, TypeError, ValueError) as e:
-            print(f"WARNING: Could not parse location constraints: {e}")
-        return anchors
+class DataValidator:
+    """Validates incoming JSON data structure"""
     
-    def _parse_creative_anchors(self) -> List[NonNegotiableConstraint]:
-        # Implementation for Director & DOP notes
-        # ... (This logic was correct and remains the same)
-        return []
+    @staticmethod
+    def validate_input(data: Any) -> bool:
+        """Validate the input data structure matches expected schema"""
+        try:
+            if not isinstance(data, list) or len(data) != 1:
+                raise ValueError("Input must be an array with exactly one object")
+            
+            production_data = data[0]
+            required_keys = ['stripboard', 'constraints', 'ga_params']
+            
+            for key in required_keys:
+                if key not in production_data:
+                    raise ValueError(f"Missing required key: {key}")
+            
+            # Validate stripboard structure
+            stripboard = production_data['stripboard']
+            if not isinstance(stripboard, list):
+                raise ValueError("Stripboard must be an array")
+            
+            # Validate at least one scene exists
+            if len(stripboard) == 0:
+                raise ValueError("Stripboard cannot be empty")
+            
+            # Validate required scene fields
+            required_scene_fields = [
+                'Scene_Number', 'INT_EXT', 'Location_Name', 'Day_Night',
+                'Synopsis', 'Page_Count', 'Script_Day', 'Cast', 'Geographic_Location'
+            ]
+            
+            for scene in stripboard:
+                for field in required_scene_fields:
+                    if field not in scene:
+                        raise ValueError(f"Scene missing required field: {field}")
+            
+            logger.info(f"Data validation successful: {len(stripboard)} scenes loaded")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Data validation failed: {str(e)}")
+            return False
 
-
-class NaiveScheduler:
-    """
-    A state-aware scheduler that correctly handles all non-negotiable constraints.
-    """
-    def __init__(self, clusters: List[LocationCluster], calendar: ShootingCalendar, parser: StructuredConstraintParser, scene_time_estimates: Dict[str, float]):
-        self.clusters = clusters
-        self.calendar = calendar
-        self.parser = parser
-        self.schedule: Dict[date, Dict] = {day: {"scenes": [], "location": None} for day in self.calendar.shooting_days}
-        self.unplaced_anchors = []
-        self.scene_time_estimates = scene_time_estimates
-        # NEW: A lookup for original constraints for each location
-        self.location_rules = self._map_location_rules()
-
-    def _map_location_rules(self) -> Dict[str, Dict]:
-        """Creates a simple lookup table for the original constraints of each location."""
-        rules = {}
-        locations_data = self.parser.raw_constraints.get('location_constraints', {}).get('locations', {})
-        for loc_name, details in locations_data.items():
-            real_address = details.get('real_address', loc_name)
-            rules[real_address] = {
-                'date_range': None,
-                'allowed_days': None
-            }
-            for constraint in details.get('constraints', []):
-                if constraint.get('constraint_level') == 'Non-negotiable':
-                    if constraint.get('constraint_type') == 'availability_window':
-                        parsed = constraint['parsed_data']
-                        rules[real_address]['date_range'] = (
-                            datetime.strptime(parsed['start_date'], "%Y-%m-%d").date(),
-                            datetime.strptime(parsed['end_date'], "%Y-%m-%d").date()
-                        )
-                    elif constraint.get('constraint_type') == 'day_restriction':
-                         rules[real_address]['allowed_days'] = constraint['parsed_data'].get('day_restrictions', [])
-        return rules
-
-    def build_schedule(self) -> List[Dict[str, Any]]:
-        self._place_anchors()
-        self._fill_remaining_days()
-        return self._format_schedule()
-
-    def _place_anchors(self):
-        """Places entire location clusters that have non-negotiable constraints."""
-        print("INFO: Placing non-negotiable anchors on the calendar...")
+class DateAnchorExtractor:
+    """Extracts date-specific non-negotiable constraints"""
+    
+    def __init__(self, constraints_data: Dict):
+        self.constraints = constraints_data
+        self.date_anchors: List[DateAnchor] = []
+    
+    def extract_all_anchors(self) -> List[DateAnchor]:
+        """Extract all date-specific non-negotiable constraints"""
+        self.date_anchors = []
         
-        for anchor in self.parser.non_negotiables:
-             if anchor.constraint_type in ['location_date_range', 'location_day_of_week']:
-                cluster_to_place = next((c for c in self.clusters if c.location == anchor.identifier), None)
-                if cluster_to_place:
-                    self._schedule_cluster(cluster_to_place)
-                    self.clusters.remove(cluster_to_place) # Remove so it's not scheduled again
-
-    def _fill_remaining_days(self):
-        """Fills empty calendar slots with the remaining flexible clusters."""
-        print("INFO: Filling remaining calendar days with flexible clusters...")
-        sorted_clusters = sorted(self.clusters, key=lambda c: c.total_hours, reverse=True)
-        for cluster in sorted_clusters:
-            self._schedule_cluster(cluster)
-
-    def _schedule_cluster(self, cluster: LocationCluster):
-        """Finds valid days for a cluster and packs its scenes."""
-        scenes_to_schedule = list(cluster.scenes)
-        day_cursor = 0
-        MAX_DAILY_HOURS = 10.0
-
-        while scenes_to_schedule:
-            # Find the next valid, available day for this cluster
-            next_valid_day_idx = self._find_next_valid_day(day_cursor, cluster.location)
-
-            if next_valid_day_idx is None:
-                print(f"WARNING: No valid days found for remaining scenes of {cluster.location}.")
-                self.unplaced_anchors.append({'identifier': cluster.location, 'scenes': [s['Scene_Number'] for s in scenes_to_schedule]})
-                return
-
-            current_date = self.calendar.shooting_days[next_valid_day_idx]
-            self.schedule[current_date]['location'] = cluster.location
-            day_cursor = next_valid_day_idx
-
-            # Pack scenes into this day
-            day_hours = 0
-            scenes_for_this_day = []
-            while scenes_to_schedule:
-                scene = scenes_to_schedule[0]
-                scene_hours = self.scene_time_estimates.get(str(scene.get('Scene_Number')), 1.0)
-                if day_hours + scene_hours <= MAX_DAILY_HOURS:
-                    scenes_for_this_day.append(scenes_to_schedule.pop(0))
-                    day_hours += scene_hours
-                else:
-                    break
-            
-            self.schedule[current_date]['scenes'] = scenes_for_this_day
-            day_cursor += 1
-            
-    def _find_next_valid_day(self, start_index: int, location: str) -> Optional[int]:
-        """Finds the next day that is both empty and valid for a given location's rules."""
-        location_rules = self.location_rules.get(location, {})
+        # Extract actor date constraints
+        self._extract_actor_date_constraints()
         
-        for i in range(start_index, len(self.calendar.shooting_days)):
-            day = self.calendar.shooting_days[i]
+        # Extract location permit constraints
+        self._extract_location_date_constraints()
+        
+        # Extract production rule date constraints
+        self._extract_production_rule_constraints()
+        
+        logger.info(f"Extracted {len(self.date_anchors)} date-specific anchors")
+        return self.date_anchors
+    
+    def _extract_actor_date_constraints(self):
+        """Extract actor availability constraints with specific dates"""
+        try:
+            people_constraints = self.constraints.get('people_constraints', {})
+            actors = people_constraints.get('actors', {})
             
-            # Check 1: Is the day already booked?
-            if self.schedule[day]['location'] is not None:
-                continue
+            for actor_id, actor_data in actors.items():
+                constraint_level = actor_data.get('constraint_level', '')
+                if constraint_level.lower() == 'non-negotiable':
+                    dates = actor_data.get('dates', [])
+                    constraint_type = actor_data.get('type', '')
+                    
+                    for date_str in dates:
+                        try:
+                            anchor_date = datetime.strptime(date_str, '%Y-%m-%d')
+                            anchor = DateAnchor(
+                                constraint_type=f'actor_{constraint_type}',
+                                entity_name=actor_id,
+                                anchor_date=anchor_date,
+                                constraint_details=actor_data.get('notes', ''),
+                                affected_scenes=[]
+                            )
+                            self.date_anchors.append(anchor)
+                            logger.info(f"Added actor anchor: {actor_id} - {constraint_type} on {date_str}")
+                        except ValueError as e:
+                            logger.warning(f"Invalid date format for actor {actor_id}: {date_str}")
+                            
+        except Exception as e:
+            logger.error(f"Error extracting actor constraints: {str(e)}")
+    
+    def _extract_location_date_constraints(self):
+        """Extract location constraints with specific dates"""
+        try:
+            location_constraints = self.constraints.get('location_constraints', {})
+            locations = location_constraints.get('locations', {})
+            
+            for location_id, location_data in locations.items():
+                constraints = location_data.get('constraints', [])
                 
-            # Check 2: Does it violate a date range rule?
-            date_range = location_rules.get('date_range')
-            if date_range and not (date_range[0] <= day <= date_range[1]):
-                continue
-
-            # Check 3: Does it violate a day-of-week rule?
-            allowed_days = location_rules.get('allowed_days')
-            if allowed_days and day.strftime('%A') not in allowed_days:
-                continue
+                for constraint in constraints:
+                    if constraint.get('constraint_level', '').lower() == 'non-negotiable':
+                        # Look for date-specific constraints in the constraint data
+                        constraint_text = str(constraint.get('raw_text', ''))
+                        if 'date' in constraint_text.lower() or 'deadline' in constraint_text.lower():
+                            # This is a simplified extraction - in real implementation,
+                            # would need more sophisticated date parsing
+                            logger.info(f"Found potential date constraint for location {location_id}")
+                            
+        except Exception as e:
+            logger.error(f"Error extracting location constraints: {str(e)}")
+    
+    def _extract_production_rule_constraints(self):
+        """Extract production rules with date-specific requirements"""
+        try:
+            operational_data = self.constraints.get('operational_data', {})
+            production_rules = operational_data.get('production_rules', {})
+            rules = production_rules.get('rules', [])
             
-            # If all checks pass, this is a valid day
-            return i
-            
-        return None
+            for rule in rules:
+                constraint_level = rule.get('constraint_level', '')
+                if constraint_level.lower() == 'non-negotiable':
+                    rule_text = rule.get('raw_text', '')
+                    if 'date' in rule_text.lower() or 'deadline' in rule_text.lower():
+                        logger.info(f"Found potential date-specific production rule: {rule.get('parameter_name', 'Unknown')}")
+                        
+        except Exception as e:
+            logger.error(f"Error extracting production rule constraints: {str(e)}")
 
-    def _format_schedule(self) -> List[Dict[str, Any]]:
-        # ... (This logic was correct and remains the same)
-        return []
-
-# --- 5. Main API Endpoint and supporting classes ---
-# ... (All remaining classes and the endpoint logic remain the same)
 class LocationClusterManager:
-    def __init__(self, stripboard: List[Dict], constraints: Dict[str, Any]):
-        self.stripboard = stripboard
-        self.scene_time_estimates = self._get_scene_time_estimates(constraints)
-        self.clusters = self._create_location_clusters()
-        print(f"INFO: Successfully created {len(self.clusters)} location clusters.")
-    def _get_scene_time_estimates(self, constraints: Dict) -> Dict[str, float]:
-        try:
-            time_estimates = constraints['operational_data']['time_estimates']['scene_estimates']
-            return { str(est[key]): float(est['Estimated_Time_Hours']) for est in time_estimates for key in est if 'Scene_Number' in key }
-        except (KeyError, TypeError): return {}
-    def _create_location_clusters(self) -> List[LocationCluster]:
-        location_groups = defaultdict(list)
-        for scene in self.stripboard:
-            location = scene.get('Geographic_Location')
-            if location and location != 'Location TBD': location_groups[location].append(scene)
-        clusters = []
-        for location, scenes in location_groups.items():
-            total_hours = sum([self.scene_time_estimates.get(str(s.get('Scene_Number')), self._estimate_scene_hours_from_page_count(s)) for s in scenes])
-            all_actors = set(actor for scene in scenes for actor in scene.get('Cast', []) if isinstance(scene.get('Cast'), list))
-            clusters.append(LocationCluster(location=location, scenes=sorted(scenes, key=lambda s: s.get('Scene_Number', '')), total_hours=round(total_hours, 2), required_actors=sorted(list(all_actors))))
-        return sorted(clusters, key=lambda c: c.total_hours, reverse=True)
-    def _estimate_scene_hours_from_page_count(self, scene: Dict) -> float:
-        page_count_str = scene.get('Page_Count', '1/8')
-        try:
-            if ' ' in page_count_str:
-                whole, fraction = page_count_str.split(' '); num, den = map(int, fraction.split('/')); return float(whole) + (num / den)
-            elif '/' in page_count_str:
-                num, den = map(int, page_count_str.split('/')); return num / den
-            else: return float(page_count_str)
-        except (ValueError, TypeError): return 0.125
-
-@app.post("/run-iteration-2", response_model=Iteration2Response)
-async def run_iteration_2(request: ScheduleRequest):
-    """
-    This endpoint executes the logic for Iteration 2.
-    It parses non-negotiable constraints, places them on the calendar,
-    and then fills the remaining days with other scenes.
-    """
-    try:
-        print("INFO: Iteration 2 started...")
-        calendar = ShootingCalendar("2025-09-01", "2025-10-31") # Dates from weather data
-        parser = StructuredConstraintParser(request.constraints)
-        cluster_manager = LocationClusterManager(request.stripboard, request.constraints)
+    """Manages geographic clustering of scenes and calculates shooting requirements"""
+    
+    def __init__(self, stripboard_data: List[Dict], time_estimates_data: List[Dict]):
+        self.stripboard = stripboard_data
+        self.time_estimates = self._create_time_estimates_lookup(time_estimates_data)
+        self.location_clusters: Dict[str, LocationCluster] = {}
+        self.scenes: List[SceneInfo] = []
         
-        scheduler = NaiveScheduler(cluster_manager.clusters, calendar, parser, cluster_manager.scene_time_estimates)
-        final_schedule = scheduler.build_schedule()
+    def _create_time_estimates_lookup(self, time_estimates_data: List[Dict]) -> Dict[str, Dict]:
+        """Create a lookup dictionary for time estimates by scene number"""
+        lookup = {}
+        for estimate in time_estimates_data:
+            scene_number = estimate.get('Scene_Number', '')
+            lookup[scene_number] = estimate
+        return lookup
+    
+    def _parse_page_count(self, page_count_str: str) -> float:
+        """Parse page count string to float (handles fractions like '2 3/8')"""
+        try:
+            # Handle simple numbers
+            if '/' not in page_count_str:
+                return float(page_count_str)
+            
+            # Handle fractions like '2 3/8' or '3/8'
+            parts = page_count_str.strip().split()
+            if len(parts) == 2:  # '2 3/8'
+                whole = float(parts[0])
+                fraction_parts = parts[1].split('/')
+                fraction = float(fraction_parts[0]) / float(fraction_parts[1])
+                return whole + fraction
+            elif len(parts) == 1 and '/' in parts[0]:  # '3/8'
+                fraction_parts = parts[0].split('/')
+                return float(fraction_parts[0]) / float(fraction_parts[1])
+            else:
+                return float(page_count_str)
+        except:
+            logger.warning(f"Could not parse page count: {page_count_str}, defaulting to 1.0")
+            return 1.0
+    
+    def _create_scene_info(self, scene_data: Dict) -> SceneInfo:
+        """Create SceneInfo object from scene data"""
+        scene_number = scene_data['Scene_Number']
         
-        return Iteration2Response(
-            message="Iteration 2 complete. Naïve schedule created.",
-            total_shooting_days=len(final_schedule),
-            schedule=final_schedule,
-            unplaced_anchors=scheduler.unplaced_anchors
+        # Get time estimate from lookup
+        estimated_hours = 0.0
+        complexity_tier = ""
+        
+        if scene_number in self.time_estimates:
+            estimate_data = self.time_estimates[scene_number]
+            try:
+                estimated_hours = float(estimate_data.get('Estimated_Time_Hours', '0'))
+            except:
+                # Fallback to page-based estimation (roughly 1 page = 1 hour)
+                page_count = self._parse_page_count(scene_data.get('Page_Count', '1'))
+                estimated_hours = page_count
+            
+            complexity_tier = estimate_data.get('Complexity_Tier', 'Medium')
+        else:
+            # Fallback estimation based on page count
+            page_count = self._parse_page_count(scene_data.get('Page_Count', '1'))
+            estimated_hours = page_count
+            complexity_tier = 'Medium'
+        
+        return SceneInfo(
+            scene_number=scene_number,
+            int_ext=scene_data['INT_EXT'],
+            location_name=scene_data['Location_Name'],
+            day_night=scene_data['Day_Night'],
+            synopsis=scene_data['Synopsis'],
+            page_count=scene_data['Page_Count'],
+            script_day=scene_data['Script_Day'],
+            cast=scene_data['Cast'],
+            geographic_location=scene_data['Geographic_Location'],
+            estimated_time_hours=estimated_hours,
+            complexity_tier=complexity_tier
         )
+    
+    def cluster_scenes_by_location(self) -> Dict[str, LocationCluster]:
+        """Group scenes by geographic location and calculate cluster metrics"""
+        # Convert stripboard to SceneInfo objects
+        self.scenes = [self._create_scene_info(scene) for scene in self.stripboard]
+        
+        # Group scenes by geographic location
+        location_groups = defaultdict(list)
+        for scene in self.scenes:
+            location_groups[scene.geographic_location].append(scene)
+        
+        # Create LocationCluster objects
+        for location, scenes in location_groups.items():
+            total_hours = sum(scene.estimated_time_hours for scene in scenes)
+            
+            # Calculate shooting days (assuming 10-hour shooting days)
+            total_days = max(1, int(total_hours / 10) + (1 if total_hours % 10 > 0 else 0))
+            
+            # Analyze complexity distribution
+            complexity_counts = defaultdict(int)
+            for scene in scenes:
+                complexity_counts[scene.complexity_tier] += 1
+            
+            # Collect all cast requirements
+            cast_requirements = set()
+            for scene in scenes:
+                cast_requirements.update(scene.cast)
+            
+            cluster = LocationCluster(
+                geographic_location=location,
+                scenes=scenes,
+                total_shooting_hours=total_hours,
+                total_shooting_days=total_days,
+                complexity_distribution=dict(complexity_counts),
+                cast_requirements=cast_requirements
+            )
+            
+            self.location_clusters[location] = cluster
+            
+            logger.info(f"Location cluster '{location}': {len(scenes)} scenes, "
+                       f"{total_hours:.1f} hours, {total_days} days")
+        
+        return self.location_clusters
+    
+    def get_cluster_summary(self) -> Dict[str, Any]:
+        """Generate summary statistics for all location clusters"""
+        total_scenes = sum(len(cluster.scenes) for cluster in self.location_clusters.values())
+        total_hours = sum(cluster.total_shooting_hours for cluster in self.location_clusters.values())
+        total_days = sum(cluster.total_shooting_days for cluster in self.location_clusters.values())
+        
+        return {
+            'total_locations': len(self.location_clusters),
+            'total_scenes': total_scenes,
+            'total_shooting_hours': total_hours,
+            'total_shooting_days': total_days,
+            'locations_by_size': sorted(
+                [(loc, cluster.total_shooting_days) for loc, cluster in self.location_clusters.items()],
+                key=lambda x: x[1],
+                reverse=True
+            )
+        }
 
-    except Exception as e:
-        print(f"ERROR: An error occurred during Iteration 2: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+class ProductionScheduler:
+    """Main scheduler class that coordinates all components"""
+    
+    def __init__(self, input_data: List[Dict]):
+        if not DataValidator.validate_input(input_data):
+            raise ValueError("Input data validation failed")
+        
+        self.production_data = input_data[0]
+        self.stripboard = self.production_data['stripboard']
+        self.constraints = self.production_data['constraints']
+        self.ga_params = self.production_data['ga_params']
+        
+        # Initialize components
+        self.date_anchor_extractor = DateAnchorExtractor(self.constraints)
+        
+        # Get time estimates data
+        time_estimates_data = (
+            self.constraints
+            .get('operational_data', {})
+            .get('time_estimates', {})
+            .get('scene_estimates', [])
+        )
+        
+        self.location_manager = LocationClusterManager(self.stripboard, time_estimates_data)
+        
+        # Initialize results storage
+        self.date_anchors: List[DateAnchor] = []
+        self.location_clusters: Dict[str, LocationCluster] = {}
+    
+    def process_iteration_1(self) -> Dict[str, Any]:
+        """Execute Iteration 1: Data loading, anchoring, and clustering"""
+        logger.info("Starting Iteration 1: Foundational Data Loading & Location Clustering")
+        
+        # Step 1: Extract date-specific non-negotiable anchors
+        logger.info("Step 1: Extracting date-specific anchors...")
+        self.date_anchors = self.date_anchor_extractor.extract_all_anchors()
+        
+        # Step 2: Create location clusters
+        logger.info("Step 2: Creating location clusters...")
+        self.location_clusters = self.location_manager.cluster_scenes_by_location()
+        
+        # Step 3: Generate summary
+        logger.info("Step 3: Generating summary...")
+        cluster_summary = self.location_manager.get_cluster_summary()
+        
+        # Compile results
+        results = {
+            'iteration': 1,
+            'status': 'completed',
+            'date_anchors': [
+                {
+                    'constraint_type': anchor.constraint_type,
+                    'entity_name': anchor.entity_name,
+                    'anchor_date': anchor.anchor_date.isoformat(),
+                    'constraint_details': anchor.constraint_details
+                }
+                for anchor in self.date_anchors
+            ],
+            'location_clusters': {
+                location: {
+                    'scene_count': len(cluster.scenes),
+                    'total_hours': cluster.total_shooting_hours,
+                    'total_days': cluster.total_shooting_days,
+                    'complexity_distribution': cluster.complexity_distribution,
+                    'cast_count': len(cluster.cast_requirements),
+                    'scenes': [scene.scene_number for scene in cluster.scenes]
+                }
+                for location, cluster in self.location_clusters.items()
+            },
+            'summary': cluster_summary
+        }
+        
+        logger.info(f"Iteration 1 completed successfully: "
+                   f"{len(self.date_anchors)} anchors, "
+                   f"{len(self.location_clusters)} location clusters")
+        
+        return results
+
+# FastAPI Application
+app = FastAPI(
+    title="Film Production Scheduling Optimizer",
+    description="AI-powered film production scheduling with hierarchical constraint optimization",
+    version="1.0.0"
+)
+
+class ScheduleRequest(BaseModel):
+    """Pydantic model for the incoming schedule request"""
+    data: List[Dict[str, Any]]
+
+class ScheduleResponse(BaseModel):
+    """Pydantic model for the schedule response"""
+    success: bool
+    iteration: int
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    processing_time_seconds: Optional[float] = None
 
 @app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "message": "Film Production Scheduling Optimizer",
+        "status": "active",
+        "iteration": 1,
+        "description": "Foundational Data Loading & Location Clustering"
+    }
+
+@app.get("/health")
 async def health_check():
-    return {"status": "healthy", "iteration": 2}
+    """Detailed health check for Railway deployment"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "film-scheduler",
+        "iteration": 1
+    }
+
+@app.post("/schedule", response_model=ScheduleResponse)
+async def create_schedule(request: ScheduleRequest):
+    """
+    Main endpoint to process film production scheduling
+    Expects JSON payload matching the http_request.schema.json structure
+    """
+    start_time = datetime.now()
+    
+    try:
+        logger.info("Received scheduling request")
+        logger.info(f"Input data size: {len(request.data)} objects")
+        
+        # Initialize scheduler with the input data
+        scheduler = ProductionScheduler(request.data)
+        
+        # Process Iteration 1
+        results = scheduler.process_iteration_1()
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Processing completed in {processing_time:.2f} seconds")
+        
+        return ScheduleResponse(
+            success=True,
+            iteration=1,
+            data=results,
+            processing_time_seconds=processing_time
+        )
+        
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        return ScheduleResponse(
+            success=False,
+            iteration=1,
+            error=f"Data validation failed: {str(e)}",
+            processing_time_seconds=(datetime.now() - start_time).total_seconds()
+        )
+        
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return ScheduleResponse(
+            success=False,
+            iteration=1,
+            error=f"Processing failed: {str(e)}",
+            processing_time_seconds=(datetime.now() - start_time).total_seconds()
+        )
+
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(request: Request, exc: ValidationError):
+    """Handle Pydantic validation errors"""
+    logger.error(f"Validation error: {exc}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": "Invalid request format",
+            "details": exc.errors()
+        }
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler for unexpected errors"""
+    logger.error(f"Unhandled exception: {exc}")
+    logger.error(f"Traceback: {traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": "Internal server error",
+            "details": str(exc)
+        }
+    )
+
+def main():
+    """Main entry point for local testing"""
+    try:
+        # Example usage for local testing
+        sample_data = [{
+            'stripboard': [
+                {
+                    'Scene_Number': '1',
+                    'INT_EXT': 'INT',
+                    'Location_Name': 'Kitchen',
+                    'Day_Night': 'DAY',
+                    'Synopsis': 'Character A makes breakfast',
+                    'Page_Count': '2',
+                    'Script_Day': '1',
+                    'Cast': ['Actor1', 'Actor2'],
+                    'Geographic_Location': 'House_Interior'
+                }
+            ],
+            'constraints': {
+                'people_constraints': {'actors': {}},
+                'operational_data': {'time_estimates': {'scene_estimates': []}},
+                'creative_constraints': {},
+                'location_constraints': {},
+                'technical_constraints': {}
+            },
+            'ga_params': {
+                'phase1_population': 100,
+                'phase1_generations': 50,
+                'mutation_rate': 0.1,
+                'crossover_rate': 0.8,
+                'seed': 42,
+                'conflict_tolerance': 0.05
+            }
+        }]
+        
+        scheduler = ProductionScheduler(sample_data)
+        results = scheduler.process_iteration_1()
+        
+        print("=== Iteration 1 Results ===")
+        print(json.dumps(results, indent=2))
+        
+    except Exception as e:
+        logger.error(f"Error in main execution: {str(e)}")
+        raise
 
 if __name__ == "__main__":
-    print("INFO: Starting FastAPI server for Iteration 2...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    # For Railway deployment, use uvicorn
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
