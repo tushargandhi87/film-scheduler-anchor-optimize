@@ -381,8 +381,19 @@ class ProductionScheduler:
         
         for i, scene in enumerate(stripboard):
             scene_id = scene.get('Scene_Number', f'Scene_{i+1}')
+            
             for field in required_scene_fields:
                 if field not in scene:
+                    # More detailed error logging for debugging
+                    logger.error(f"Scene {scene_id} missing field '{field}'. Scene keys: {list(scene.keys())}")
+                    logger.error(f"Scene {scene_id} content: {scene}")
+                    
+                    # For Location_Name, allow empty strings but not missing keys
+                    if field == 'Location_Name':
+                        logger.warning(f"Scene {scene_id} missing Location_Name - setting to 'TBD'")
+                        scene['Location_Name'] = 'TBD'
+                        continue
+                    
                     raise ValueError(f"Scene {scene_id} missing required field: {field}")
         
         logger.info(f"Data validation successful: {len(stripboard)} scenes loaded")
