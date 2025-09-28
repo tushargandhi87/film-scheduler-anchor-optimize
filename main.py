@@ -238,16 +238,65 @@ class DateAnchorExtractor:
                 constraints = location_data.get('constraints', [])
                 
                 for constraint in constraints:
-                    if constraint.get('constraint_level', '').lower() == 'non-negotiable':
-                        # Look for date-specific constraints in the constraint data
-                        constraint_text = str(constraint.get('raw_text', ''))
-                        if 'date' in constraint_text.lower() or 'deadline' in constraint_text.lower():
-                            # This is a simplified extraction - in real implementation,
-                            # would need more sophisticated date parsing
-                            logger.info(f"Found potential date constraint for location {location_id}")
+                    constraint_level = constraint.get('constraint_level', '')
+                    constraint_type = constraint.get('constraint_type', '')
+                    
+                    # Only process Non-negotiable and Hard constraints with date availability windows
+                    if (constraint_level.lower() in ['non-negotiable', 'hard'] and 
+                        constraint_type == 'availability_window'):
+                        
+                        parsed_data = constraint.get('parsed_data', {})
+                        start_date_str = parsed_data.get('start_date')
+                        end_date_str = parsed_data.get('end_date')
+                        
+                        if start_date_str and end_date_str:
+                            try:
+                                start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+                                end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+                                
+                                # Create anchor for location availability window
+                                # For single day availability, create one anchor
+                                # For multi-day windows, create anchor for the window
+                                if start_date == end_date:
+                                    # Single day availability
+                                    anchor = DateAnchor(
+                                        constraint_type=f'location_availability_{constraint_level.lower()}',
+                                        entity_name=location_id,
+                                        anchor_date=start_date,
+                                        constraint_details=f"Available on {start_date_str} only - {constraint.get('original_text', '')}",
+                                        affected_scenes=[]
+                                    )
+                                    self.date_anchors.append(anchor)
+                                    logger.info(f"Added location anchor: {location_id} available on {start_date_str}")
+                                else:
+                                    # Multi-day availability window - create anchor for start and end
+                                    start_anchor = DateAnchor(
+                                        constraint_type=f'location_window_start_{constraint_level.lower()}',
+                                        entity_name=location_id,
+                                        anchor_date=start_date,
+                                        constraint_details=f"Available from {start_date_str} to {end_date_str} - {constraint.get('original_text', '')}",
+                                        affected_scenes=[]
+                                    )
+                                    end_anchor = DateAnchor(
+                                        constraint_type=f'location_window_end_{constraint_level.lower()}',
+                                        entity_name=location_id,
+                                        anchor_date=end_date,
+                                        constraint_details=f"Available from {start_date_str} to {end_date_str} - {constraint.get('original_text', '')}",
+                                        affected_scenes=[]
+                                    )
+                                    self.date_anchors.append(start_anchor)
+                                    self.date_anchors.append(end_anchor)
+                                    logger.info(f"Added location window anchors: {location_id} available {start_date_str} to {end_date_str}")
+                                    
+                            except ValueError as e:
+                                logger.warning(f"Invalid date format for location {location_id}: {start_date_str} - {end_date_str}")
+                        else:
+                            logger.debug(f"Location {location_id} constraint missing date information")
                             
         except Exception as e:
             logger.error(f"Error extracting location constraints: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
     
     def _extract_production_rule_constraints(self):
         """Extract production rules with date-specific requirements"""
