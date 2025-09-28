@@ -8,6 +8,8 @@ This iteration implements:
 3. LocationClusterManager for geographic scene clustering
 4. Shooting time calculation per location cluster
 5. FastAPI web service for deployment on Railway
+6. BOM character handling and robust time estimation
+7. Hours per day extraction from production rules
 """
 
 import json
@@ -60,60 +62,118 @@ class LocationCluster:
     complexity_distribution: Dict[str, int]
     cast_requirements: set
 
-class DataValidator:
-    """Validates incoming JSON data structure"""
+# FastAPI Application
+app = FastAPI(
+    title="Film Production Scheduling Optimizer",
+    description="AI-powered film production scheduling with hierarchical constraint optimization",
+    version="1.0.0"
+)
+
+class ScheduleResponse(BaseModel):
+    """Pydantic model for the schedule response"""
+    success: bool
+    iteration: int
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    processing_time_seconds: Optional[float] = None
+
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "message": "Film Production Scheduling Optimizer",
+        "status": "active",
+        "iteration": 1,
+        "description": "Foundational Data Loading & Location Clustering"
+    }
+
+@app.get("/health")
+async def health_check():
+    """Detailed health check for Railway deployment"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "film-scheduler",
+        "iteration": 1
+    }
+
+@app.post("/schedule", response_model=ScheduleResponse)
+async def create_schedule(request: Request):
+    """
+    Main endpoint to process film production scheduling
+    Expects JSON object with production data
+    """
+    start_time = datetime.now()
     
-    @staticmethod
-    def validate_input(data: Any) -> bool:
-        """Validate the input data structure matches expected schema"""
-        try:
-            logger.info("Starting data validation...")
-            
-            if not isinstance(data, list) or len(data) != 1:
-                raise ValueError("Input must be an array with exactly one object")
-            
-            production_data = data[0]
-            required_keys = ['stripboard', 'constraints', 'ga_params']
-            
-            for key in required_keys:
-                if key not in production_data:
-                    raise ValueError(f"Missing required key: {key}")
-            
-            logger.info("Top-level keys validated successfully")
-            
-            # Validate stripboard structure
-            stripboard = production_data['stripboard']
-            if not isinstance(stripboard, list):
-                raise ValueError("Stripboard must be an array")
-            
-            # Validate at least one scene exists
-            if len(stripboard) == 0:
-                raise ValueError("Stripboard cannot be empty")
-            
-            logger.info(f"Stripboard structure validated: {len(stripboard)} scenes found")
-            
-            # Validate required scene fields
-            required_scene_fields = [
-                'Scene_Number', 'INT_EXT', 'Location_Name', 'Day_Night',
-                'Synopsis', 'Page_Count', 'Script_Day', 'Cast', 'Geographic_Location'
-            ]
-            
-            for i, scene in enumerate(stripboard):
-                logger.info(f"Validating scene {i+1}: {scene.get('Scene_Number', 'UNKNOWN')}")
-                for field in required_scene_fields:
-                    if field not in scene:
-                        raise ValueError(f"Scene {scene.get('Scene_Number', i+1)} missing required field: {field}")
-            
-            logger.info(f"All scene fields validated successfully")
-            logger.info(f"Data validation successful: {len(stripboard)} scenes loaded")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Data validation failed with exception: {str(e)}")
-            logger.error(f"Exception type: {type(e).__name__}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            return False
+    try:
+        # Parse raw JSON body
+        body = await request.json()
+        
+        logger.info("Received scheduling request")
+        logger.info(f"Raw body type: {type(body)}")
+        
+        # Initialize scheduler with the input data
+        # ProductionScheduler will extract hours_per_day from production rules
+        scheduler = ProductionScheduler(body)
+        
+        # Process Iteration 1
+        results = scheduler.process_iteration_1()
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Processing completed in {processing_time:.2f} seconds")
+        
+        return ScheduleResponse(
+            success=True,
+            iteration=1,
+            data=results,
+            processing_time_seconds=processing_time
+        )
+        
+    except ValueError as e:
+        logger.error(f"Validation error: {str(e)}")
+        return ScheduleResponse(
+            success=False,
+            iteration=1,
+            error=f"Data validation failed: {str(e)}",
+            processing_time_seconds=(datetime.now() - start_time).total_seconds()
+        )
+        
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return ScheduleResponse(
+            success=False,
+            iteration=1,
+            error=f"Processing failed: {str(e)}",
+            processing_time_seconds=(datetime.now() - start_time).total_seconds()
+        )
+
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(request: Request, exc: ValidationError):
+    """Handle Pydantic validation errors"""
+    logger.error(f"Validation error: {exc}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": "Invalid request format",
+            "details": exc.errors()
+        }
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler for unexpected errors"""
+    logger.error(f"Unhandled exception: {exc}")
+    logger.error(f"Traceback: {traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": "Internal server error",
+            "details": str(exc)
+        }
+    )
 
 class DateAnchorExtractor:
     """Extracts date-specific non-negotiable constraints"""
@@ -209,29 +269,75 @@ class DateAnchorExtractor:
 class LocationClusterManager:
     """Manages geographic clustering of scenes and calculates shooting requirements"""
     
-    def __init__(self, stripboard_data: List[Dict], time_estimates_data: List[Dict]):
+    def __init__(self, stripboard_data: List[Dict], time_estimates_data: List[Dict], hours_per_day: float = 10.0):
         self.stripboard = stripboard_data
+        self.hours_per_day = hours_per_day  # Configurable shooting day length
         self.time_estimates = self._create_time_estimates_lookup(time_estimates_data)
         self.location_clusters: Dict[str, LocationCluster] = {}
         self.scenes: List[SceneInfo] = []
+        self.time_estimate_stats = {
+            'total_scenes': len(stripboard_data),
+            'matched_estimates': 0,
+            'fallback_page_count': 0,
+            'failed_matches': 0
+        }
         
+    def _clean_bom_and_keys(self, data: Dict) -> Dict:
+        """Remove BOM characters from dictionary keys and values"""
+        cleaned = {}
+        for key, value in data.items():
+            # Remove BOM character (U+FEFF) from keys
+            clean_key = key.lstrip('\ufeff').strip()
+            cleaned[clean_key] = value
+        return cleaned
+    
     def _create_time_estimates_lookup(self, time_estimates_data: List[Dict]) -> Dict[str, Dict]:
-        """Create a lookup dictionary for time estimates by scene number"""
+        """Create a lookup dictionary for time estimates by scene number with BOM handling"""
         lookup = {}
-        for estimate in time_estimates_data:
-            scene_number = estimate.get('Scene_Number', '')
-            lookup[scene_number] = estimate
+        
+        if not time_estimates_data:
+            logger.warning("No time estimates data provided - will use page count fallback")
+            return lookup
+            
+        logger.info(f"Processing {len(time_estimates_data)} time estimate records")
+        
+        for i, estimate in enumerate(time_estimates_data):
+            try:
+                # Clean BOM characters from all keys
+                cleaned_estimate = self._clean_bom_and_keys(estimate)
+                
+                # Try multiple possible scene number field names
+                scene_number = None
+                possible_scene_fields = ['Scene_Number', 'scene_number', 'Scene_ID', 'scene_id']
+                
+                for field in possible_scene_fields:
+                    if field in cleaned_estimate:
+                        scene_number = str(cleaned_estimate[field]).strip()
+                        break
+                
+                if scene_number:
+                    lookup[scene_number] = cleaned_estimate
+                    logger.debug(f"Matched time estimate for scene {scene_number}")
+                else:
+                    logger.warning(f"Time estimate record {i+1} missing scene number. Keys: {list(cleaned_estimate.keys())}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing time estimate record {i+1}: {str(e)}")
+        
+        logger.info(f"Successfully created time estimates lookup for {len(lookup)} scenes")
         return lookup
     
     def _parse_page_count(self, page_count_str: str) -> float:
         """Parse page count string to float (handles fractions like '2 3/8')"""
         try:
+            page_count_str = str(page_count_str).strip()
+            
             # Handle simple numbers
             if '/' not in page_count_str:
                 return float(page_count_str)
             
             # Handle fractions like '2 3/8' or '3/8'
-            parts = page_count_str.strip().split()
+            parts = page_count_str.split()
             if len(parts) == 2:  # '2 3/8'
                 whole = float(parts[0])
                 fraction_parts = parts[1].split('/')
@@ -242,33 +348,57 @@ class LocationClusterManager:
                 return float(fraction_parts[0]) / float(fraction_parts[1])
             else:
                 return float(page_count_str)
-        except:
-            logger.warning(f"Could not parse page count: {page_count_str}, defaulting to 1.0")
+        except Exception as e:
+            logger.warning(f"Could not parse page count: '{page_count_str}' - {str(e)}, defaulting to 1.0")
             return 1.0
     
-    def _create_scene_info(self, scene_data: Dict) -> SceneInfo:
-        """Create SceneInfo object from scene data"""
-        scene_number = scene_data['Scene_Number']
+    def _extract_time_and_complexity(self, scene_data: Dict, scene_number: str) -> Tuple[float, str]:
+        """Extract time estimate and complexity from scene data with multiple fallback strategies"""
         
-        # Get time estimate from lookup
-        estimated_hours = 0.0
-        complexity_tier = ""
-        
+        # Strategy 1: Try to get from time estimates lookup
         if scene_number in self.time_estimates:
             estimate_data = self.time_estimates[scene_number]
             try:
-                estimated_hours = float(estimate_data.get('Estimated_Time_Hours', '0'))
-            except:
-                # Fallback to page-based estimation (roughly 1 page = 1 hour)
-                page_count = self._parse_page_count(scene_data.get('Page_Count', '1'))
-                estimated_hours = page_count
-            
-            complexity_tier = estimate_data.get('Complexity_Tier', 'Medium')
-        else:
-            # Fallback estimation based on page count
+                # Try multiple possible time field names
+                time_fields = ['Estimated_Time_Hours', 'estimated_time_hours', 'Time_Hours', 'Hours']
+                estimated_hours = None
+                
+                for field in time_fields:
+                    if field in estimate_data:
+                        estimated_hours = float(estimate_data[field])
+                        break
+                
+                if estimated_hours is not None:
+                    complexity_tier = estimate_data.get('Complexity_Tier', 
+                                                      estimate_data.get('complexity_tier', 'Medium'))
+                    self.time_estimate_stats['matched_estimates'] += 1
+                    logger.debug(f"Scene {scene_number}: {estimated_hours}h ({complexity_tier})")
+                    return estimated_hours, complexity_tier
+                    
+            except Exception as e:
+                logger.warning(f"Error parsing time estimate for scene {scene_number}: {str(e)}")
+        
+        # Strategy 2: Fallback to page-based estimation
+        try:
             page_count = self._parse_page_count(scene_data.get('Page_Count', '1'))
-            estimated_hours = page_count
-            complexity_tier = 'Medium'
+            estimated_hours = page_count * 1.0  # 1 page ≈ 1 hour rule of thumb
+            complexity_tier = 'Medium'  # Default complexity for page-based estimates
+            
+            self.time_estimate_stats['fallback_page_count'] += 1
+            logger.debug(f"Scene {scene_number}: {estimated_hours}h (page fallback)")
+            return estimated_hours, complexity_tier
+            
+        except Exception as e:
+            logger.error(f"Failed to estimate time for scene {scene_number}: {str(e)}")
+            self.time_estimate_stats['failed_matches'] += 1
+            return 1.0, 'Medium'  # Ultimate fallback
+    
+    def _create_scene_info(self, scene_data: Dict) -> SceneInfo:
+        """Create SceneInfo object from scene data with robust time estimation"""
+        scene_number = str(scene_data['Scene_Number']).strip()
+        
+        # Get time estimate and complexity
+        estimated_hours, complexity_tier = self._extract_time_and_complexity(scene_data, scene_number)
         
         return SceneInfo(
             scene_number=scene_number,
@@ -298,8 +428,8 @@ class LocationClusterManager:
         for location, scenes in location_groups.items():
             total_hours = sum(scene.estimated_time_hours for scene in scenes)
             
-            # Calculate shooting days (assuming 10-hour shooting days)
-            total_days = max(1, int(total_hours / 10) + (1 if total_hours % 10 > 0 else 0))
+            # Calculate shooting days using configurable hours per day
+            total_days = max(1, int(total_hours / self.hours_per_day) + (1 if total_hours % self.hours_per_day > 0 else 0))
             
             # Analyze complexity distribution
             complexity_counts = defaultdict(int)
@@ -325,6 +455,14 @@ class LocationClusterManager:
             logger.info(f"Location cluster '{location}': {len(scenes)} scenes, "
                        f"{total_hours:.1f} hours, {total_days} days")
         
+        # Log time estimation statistics
+        stats = self.time_estimate_stats
+        logger.info(f"Time Estimation Statistics:")
+        logger.info(f"  Total scenes: {stats['total_scenes']}")
+        logger.info(f"  Matched estimates: {stats['matched_estimates']}")
+        logger.info(f"  Page fallback: {stats['fallback_page_count']}")
+        logger.info(f"  Failed matches: {stats['failed_matches']}")
+        
         return self.location_clusters
     
     def get_cluster_summary(self) -> Dict[str, Any]:
@@ -338,6 +476,8 @@ class LocationClusterManager:
             'total_scenes': total_scenes,
             'total_shooting_hours': total_hours,
             'total_shooting_days': total_days,
+            'hours_per_day_configured': self.hours_per_day,
+            'time_estimation_stats': self.time_estimate_stats,
             'locations_by_size': sorted(
                 [(loc, cluster.total_shooting_days) for loc, cluster in self.location_clusters.items()],
                 key=lambda x: x[1],
@@ -384,10 +524,6 @@ class ProductionScheduler:
             
             for field in required_scene_fields:
                 if field not in scene:
-                    # More detailed error logging for debugging
-                    logger.error(f"Scene {scene_id} missing field '{field}'. Scene keys: {list(scene.keys())}")
-                    logger.error(f"Scene {scene_id} content: {scene}")
-                    
                     # For Location_Name, allow empty strings but not missing keys
                     if field == 'Location_Name':
                         logger.warning(f"Scene {scene_id} missing Location_Name - setting to 'TBD'")
@@ -398,10 +534,15 @@ class ProductionScheduler:
         
         logger.info(f"Data validation successful: {len(stripboard)} scenes loaded")
         
+        # Store configuration
         self.production_data = production_data
         self.stripboard = self.production_data['stripboard']
         self.constraints = self.production_data['constraints']
         self.ga_params = self.production_data['ga_params']
+        
+        # Extract hours per day from production rules
+        self.hours_per_day = self._extract_hours_per_day()
+        logger.info(f"Using hours_per_day: {self.hours_per_day}")
         
         # Initialize components
         self.date_anchor_extractor = DateAnchorExtractor(self.constraints)
@@ -414,13 +555,50 @@ class ProductionScheduler:
             .get('scene_estimates', [])
         )
         
-        self.location_manager = LocationClusterManager(self.stripboard, time_estimates_data)
+        self.location_manager = LocationClusterManager(
+            self.stripboard, 
+            time_estimates_data, 
+            hours_per_day=self.hours_per_day
+        )
         
         # Initialize results storage
-        self.date_anchors: List[DateAnchor] = []
-        self.location_clusters: Dict[str, LocationCluster] = {}
+        self.date_anchors = []
+        self.location_clusters = {}
     
-    def process_iteration_1(self) -> Dict[str, Any]:
+    def _extract_hours_per_day(self) -> float:
+        """Extract hours per day from production rules constraints"""
+        try:
+            production_rules = (
+                self.constraints
+                .get('operational_data', {})
+                .get('production_rules', {})
+                .get('rules', [])
+            )
+            
+            for rule in production_rules:
+                # Look for standard work day hours rule
+                parameter_name = rule.get('parameter_name', '')
+                rule_type = rule.get('parsed_data', {}).get('rule_type', '')
+                
+                if (parameter_name == 'standard_work_day_hours' or 
+                    rule_type == 'standard_day_length'):
+                    
+                    parsed_data = rule.get('parsed_data', {})
+                    hours = parsed_data.get('hours')
+                    
+                    if hours is not None:
+                        hours_float = float(hours)
+                        logger.info(f"Found hours_per_day in production rules: {hours_float}")
+                        return hours_float
+            
+            logger.warning("No standard work day hours found in production rules, using default 10.0")
+            return 10.0
+            
+        except Exception as e:
+            logger.error(f"Error extracting hours_per_day from production rules: {str(e)}")
+            return 10.0
+    
+    def process_iteration_1(self):
         """Execute Iteration 1: Data loading, anchoring, and clustering"""
         logger.info("Starting Iteration 1: Foundational Data Loading & Location Clustering")
         
@@ -469,144 +647,11 @@ class ProductionScheduler:
         
         return results
 
-# FastAPI Application
-app = FastAPI(
-    title="Film Production Scheduling Optimizer",
-    description="AI-powered film production scheduling with hierarchical constraint optimization",
-    version="1.0.0"
-)
-
-class ScheduleResponse(BaseModel):
-    """Pydantic model for the schedule response"""
-    success: bool
-    iteration: int
-    data: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-    processing_time_seconds: Optional[float] = None
-
-@app.get("/")
-async def root():
-    """Health check endpoint"""
-    return {
-        "message": "Film Production Scheduling Optimizer",
-        "status": "active",
-        "iteration": 1,
-        "description": "Foundational Data Loading & Location Clustering"
-    }
-
-@app.get("/health")
-async def health_check():
-    """Detailed health check for Railway deployment"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "service": "film-scheduler",
-        "iteration": 1
-    }
-
-@app.post("/schedule", response_model=ScheduleResponse)
-async def create_schedule(request: Request):
-    """
-    Main endpoint to process film production scheduling
-    Expects JSON object with optional hours_per_day configuration
-    """
-    start_time = datetime.now()
-    
-    try:
-        # Parse raw JSON body
-        body = await request.json()
-        
-        logger.info("Received scheduling request")
-        logger.info(f"Raw body type: {type(body)}")
-        
-        # Extract configuration parameters
-        hours_per_day = 10.0  # Default value
-        
-        # Check if hours_per_day is provided in the request
-        if isinstance(body, dict):
-            # If body is a dict, check for hours_per_day at top level
-            hours_per_day = body.get('hours_per_day', 10.0)
-            
-            # Also check in ga_params if it exists
-            if 'ga_params' in body and isinstance(body['ga_params'], dict):
-                hours_per_day = body['ga_params'].get('hours_per_day', hours_per_day)
-        elif isinstance(body, list) and len(body) > 0 and isinstance(body[0], dict):
-            # If body is a list, check the first object
-            hours_per_day = body[0].get('hours_per_day', 10.0)
-            
-            # Also check in ga_params if it exists
-            if 'ga_params' in body[0] and isinstance(body[0]['ga_params'], dict):
-                hours_per_day = body[0]['ga_params'].get('hours_per_day', hours_per_day)
-        
-        logger.info(f"Using hours_per_day: {hours_per_day}")
-        
-        # Initialize scheduler with the input data and configuration
-        scheduler = ProductionScheduler(body, hours_per_day=hours_per_day)
-        
-        # Process Iteration 1
-        results = scheduler.process_iteration_1()
-        
-        processing_time = (datetime.now() - start_time).total_seconds()
-        logger.info(f"Processing completed in {processing_time:.2f} seconds")
-        
-        return ScheduleResponse(
-            success=True,
-            iteration=1,
-            data=results,
-            processing_time_seconds=processing_time
-        )
-        
-    except ValueError as e:
-        logger.error(f"Validation error: {str(e)}")
-        return ScheduleResponse(
-            success=False,
-            iteration=1,
-            error=f"Data validation failed: {str(e)}",
-            processing_time_seconds=(datetime.now() - start_time).total_seconds()
-        )
-        
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        return ScheduleResponse(
-            success=False,
-            iteration=1,
-            error=f"Processing failed: {str(e)}",
-            processing_time_seconds=(datetime.now() - start_time).total_seconds()
-        )
-
-@app.exception_handler(ValidationError)
-async def validation_exception_handler(request: Request, exc: ValidationError):
-    """Handle Pydantic validation errors"""
-    logger.error(f"Validation error: {exc}")
-    return JSONResponse(
-        status_code=422,
-        content={
-            "success": False,
-            "error": "Invalid request format",
-            "details": exc.errors()
-        }
-    )
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler for unexpected errors"""
-    logger.error(f"Unhandled exception: {exc}")
-    logger.error(f"Traceback: {traceback.format_exc()}")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "success": False,
-            "error": "Internal server error",
-            "details": str(exc)
-        }
-    )
-
 def main():
     """Main entry point for local testing"""
     try:
         # Example usage for local testing
-        sample_data = [{
+        sample_data = {
             'stripboard': [
                 {
                     'Scene_Number': '1',
@@ -622,7 +667,17 @@ def main():
             ],
             'constraints': {
                 'people_constraints': {'actors': {}},
-                'operational_data': {'time_estimates': {'scene_estimates': []}},
+                'operational_data': {
+                    'time_estimates': {'scene_estimates': []},
+                    'production_rules': {
+                        'rules': [
+                            {
+                                'parameter_name': 'standard_work_day_hours',
+                                'parsed_data': {'hours': 12}
+                            }
+                        ]
+                    }
+                },
                 'creative_constraints': {},
                 'location_constraints': {},
                 'technical_constraints': {}
@@ -635,7 +690,7 @@ def main():
                 'seed': 42,
                 'conflict_tolerance': 0.05
             }
-        }]
+        }
         
         scheduler = ProductionScheduler(sample_data)
         results = scheduler.process_iteration_1()
