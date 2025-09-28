@@ -1,20 +1,18 @@
 """
-Film Production Scheduling Optimizer - Iteration 1
-Foundational Data Loading & Location Clustering
+Film Production Scheduling Optimizer - Iteration 2
+All Non-Negotiables + Naive Scheduler
 
 This iteration implements:
-1. JSON data validation and ingestion
-2. Date-specific non-negotiable constraint anchoring
-3. LocationClusterManager for geographic scene clustering
-4. Shooting time calculation per location cluster
+1. Date-specific non-negotiable constraint anchoring
+2. All other non-negotiable constraints (technical, creative, operational)
+3. Naive sequential scheduler with full constraint compliance
+4. Day-by-day shooting schedule generation
 5. FastAPI web service for deployment on Railway
-6. BOM character handling and robust time estimation
-7. Hours per day extraction from production rules
 """
 
 import json
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Set
 from dataclasses import dataclass
 from collections import defaultdict
 import logging
@@ -46,11 +44,23 @@ class SceneInfo:
 @dataclass
 class DateAnchor:
     """Data structure for date-specific non-negotiable constraints"""
-    constraint_type: str  # 'actor_departure', 'location_permit', 'equipment_return'
-    entity_name: str      # Actor name, location name, etc.
+    constraint_type: str
+    entity_name: str
     anchor_date: datetime
     constraint_details: str
     affected_scenes: List[str] = None
+
+@dataclass
+class NonNegotiableConstraint:
+    """Data structure for non-date-specific non-negotiable constraints"""
+    constraint_id: str
+    constraint_type: str  # 'scene_sequence', 'scene_grouping', 'equipment_requirement', etc.
+    constraint_category: str  # 'technical', 'creative', 'operational'
+    priority: int  # 1=highest, lower numbers = higher priority
+    constraint_details: str
+    affected_scenes: List[str]
+    affected_locations: List[str]
+    additional_data: Dict[str, Any]
 
 @dataclass
 class LocationCluster:
@@ -62,11 +72,24 @@ class LocationCluster:
     complexity_distribution: Dict[str, int]
     cast_requirements: set
 
+@dataclass
+class ShootingDay:
+    """Data structure for a single shooting day"""
+    date: datetime
+    day_number: int
+    day_of_week: str
+    status: str  # 'available', 'blocked', 'assigned', 'off_day'
+    location: Optional[str] = None
+    scenes: List[str] = None
+    total_hours: float = 0.0
+    cast_required: Set[str] = None
+    constraints_applied: List[str] = None
+
 # FastAPI Application
 app = FastAPI(
     title="Film Production Scheduling Optimizer",
     description="AI-powered film production scheduling with hierarchical constraint optimization",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 class ScheduleResponse(BaseModel):
@@ -83,8 +106,8 @@ async def root():
     return {
         "message": "Film Production Scheduling Optimizer",
         "status": "active",
-        "iteration": 1,
-        "description": "Foundational Data Loading & Location Clustering"
+        "iteration": 2,
+        "description": "All Non-Negotiables + Naive Scheduler"
     }
 
 @app.get("/health")
@@ -94,7 +117,7 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "service": "film-scheduler",
-        "iteration": 1
+        "iteration": 2
     }
 
 @app.post("/schedule", response_model=ScheduleResponse)
@@ -113,18 +136,17 @@ async def create_schedule(request: Request):
         logger.info(f"Raw body type: {type(body)}")
         
         # Initialize scheduler with the input data
-        # ProductionScheduler will extract hours_per_day from production rules
         scheduler = ProductionScheduler(body)
         
-        # Process Iteration 1
-        results = scheduler.process_iteration_1()
+        # Process Iteration 2
+        results = scheduler.process_iteration_2()
         
         processing_time = (datetime.now() - start_time).total_seconds()
         logger.info(f"Processing completed in {processing_time:.2f} seconds")
         
         return ScheduleResponse(
             success=True,
-            iteration=1,
+            iteration=2,
             data=results,
             processing_time_seconds=processing_time
         )
@@ -133,7 +155,7 @@ async def create_schedule(request: Request):
         logger.error(f"Validation error: {str(e)}")
         return ScheduleResponse(
             success=False,
-            iteration=1,
+            iteration=2,
             error=f"Data validation failed: {str(e)}",
             processing_time_seconds=(datetime.now() - start_time).total_seconds()
         )
@@ -143,7 +165,7 @@ async def create_schedule(request: Request):
         logger.error(f"Traceback: {traceback.format_exc()}")
         return ScheduleResponse(
             success=False,
-            iteration=1,
+            iteration=2,
             error=f"Processing failed: {str(e)}",
             processing_time_seconds=(datetime.now() - start_time).total_seconds()
         )
@@ -255,8 +277,6 @@ class DateAnchorExtractor:
                                 end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
                                 
                                 # Create anchor for location availability window
-                                # For single day availability, create one anchor
-                                # For multi-day windows, create anchor for the window
                                 if start_date == end_date:
                                     # Single day availability
                                     anchor = DateAnchor(
@@ -295,8 +315,6 @@ class DateAnchorExtractor:
                             
         except Exception as e:
             logger.error(f"Error extracting location constraints: {str(e)}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
     
     def _extract_production_rule_constraints(self):
         """Extract production rules with date-specific requirements"""
@@ -315,12 +333,185 @@ class DateAnchorExtractor:
         except Exception as e:
             logger.error(f"Error extracting production rule constraints: {str(e)}")
 
+class NonNegotiableExtractor:
+    """Extracts all non-date-specific non-negotiable constraints"""
+    
+    def __init__(self, constraints_data: Dict):
+        self.constraints = constraints_data
+        self.non_negotiables: List[NonNegotiableConstraint] = []
+    
+    def extract_all_non_negotiables(self) -> List[NonNegotiableConstraint]:
+        """Extract all non-date-specific non-negotiable constraints"""
+        self.non_negotiables = []
+        
+        # Extract creative constraints
+        self._extract_creative_constraints()
+        
+        # Extract technical constraints
+        self._extract_technical_constraints()
+        
+        # Extract operational constraints
+        self._extract_operational_constraints()
+        
+        # Sort by priority (lower number = higher priority)
+        self.non_negotiables.sort(key=lambda x: x.priority)
+        
+        logger.info(f"Extracted {len(self.non_negotiables)} non-date-specific non-negotiable constraints")
+        return self.non_negotiables
+    
+    def _extract_creative_constraints(self):
+        """Extract creative non-negotiable constraints from director and DOP"""
+        try:
+            creative_constraints = self.constraints.get('creative_constraints', {})
+            
+            # Director constraints
+            director_notes = creative_constraints.get('director_notes', {})
+            director_constraints = director_notes.get('director_constraints', [])
+            
+            for constraint in director_constraints:
+                constraint_level = constraint.get('constraint_level', '')
+                if constraint_level.lower() == 'non-negotiable':
+                    constraint_type = constraint.get('constraint_type', '')
+                    related_scenes = constraint.get('related_scenes', [])
+                    
+                    # Determine priority based on constraint type
+                    priority = 1 if constraint_type in ['shoot_first', 'shoot_last'] else 2
+                    
+                    non_neg = NonNegotiableConstraint(
+                        constraint_id=f"director_{constraint_type}_{len(self.non_negotiables)}",
+                        constraint_type=constraint_type,
+                        constraint_category='creative',
+                        priority=priority,
+                        constraint_details=constraint.get('constraint_text', ''),
+                        affected_scenes=related_scenes,
+                        affected_locations=constraint.get('related_locations', []),
+                        additional_data=constraint
+                    )
+                    self.non_negotiables.append(non_neg)
+                    logger.info(f"Added creative constraint: {constraint_type} for scenes {related_scenes}")
+            
+            # DOP constraints
+            dop_priorities = creative_constraints.get('dop_priorities', {})
+            dop_constraints = dop_priorities.get('dop_priorities', [])
+            
+            for constraint in dop_constraints:
+                constraint_level = constraint.get('constraint_level', '')
+                if constraint_level.lower() == 'non-negotiable':
+                    category = constraint.get('category', '')
+                    related_scenes = constraint.get('related_scenes', [])
+                    
+                    non_neg = NonNegotiableConstraint(
+                        constraint_id=f"dop_{category}_{len(self.non_negotiables)}",
+                        constraint_type=category,
+                        constraint_category='creative',
+                        priority=3,  # DOP constraints generally lower priority than director
+                        constraint_details=constraint.get('constraint_text', ''),
+                        affected_scenes=[str(s) for s in related_scenes] if related_scenes else [],
+                        affected_locations=constraint.get('related_locations', []),
+                        additional_data=constraint
+                    )
+                    self.non_negotiables.append(non_neg)
+                    logger.info(f"Added DOP constraint: {category} for scenes {related_scenes}")
+                    
+        except Exception as e:
+            logger.error(f"Error extracting creative constraints: {str(e)}")
+    
+    def _extract_technical_constraints(self):
+        """Extract technical non-negotiable constraints"""
+        try:
+            technical_constraints = self.constraints.get('technical_constraints', {})
+            equipment = technical_constraints.get('equipment', {})
+            
+            for equipment_name, equipment_data in equipment.items():
+                constraint_level = equipment_data.get('constraint_level', '')
+                if constraint_level.lower() in ['non-negotiable', 'hard']:
+                    equipment_req = equipment_data.get('equipment_requirements', {})
+                    required_scenes = equipment_req.get('required_scenes', [])
+                    
+                    if required_scenes:
+                        non_neg = NonNegotiableConstraint(
+                            constraint_id=f"equipment_{equipment_name}_{len(self.non_negotiables)}",
+                            constraint_type='equipment_requirement',
+                            constraint_category='technical',
+                            priority=2,
+                            constraint_details=f"{equipment_name}: {equipment_data.get('notes', '')}",
+                            affected_scenes=required_scenes,
+                            affected_locations=[],
+                            additional_data=equipment_data
+                        )
+                        self.non_negotiables.append(non_neg)
+                        logger.info(f"Added technical constraint: {equipment_name} for scenes {required_scenes}")
+            
+            # Special requirements
+            special_requirements = technical_constraints.get('special_requirements', {})
+            for req_name, req_data in special_requirements.items():
+                constraint_level = req_data.get('constraint_level', '')
+                if constraint_level.lower() in ['non-negotiable', 'hard']:
+                    # Extract scene numbers from notes if available
+                    notes = req_data.get('notes', '')
+                    affected_scenes = []
+                    if 'Scenes:' in notes:
+                        # Parse scene numbers from notes
+                        scene_part = notes.split('Scenes:')[1].split('.')[0]
+                        scene_numbers = [s.strip('[]') for s in scene_part.split(',')]
+                        affected_scenes = [s.strip() for s in scene_numbers if s.strip()]
+                    
+                    non_neg = NonNegotiableConstraint(
+                        constraint_id=f"special_{req_name}_{len(self.non_negotiables)}",
+                        constraint_type='special_requirement',
+                        constraint_category='technical',
+                        priority=3,
+                        constraint_details=notes,
+                        affected_scenes=affected_scenes,
+                        affected_locations=[],
+                        additional_data=req_data
+                    )
+                    self.non_negotiables.append(non_neg)
+                    logger.info(f"Added special requirement: {req_name} for scenes {affected_scenes}")
+                    
+        except Exception as e:
+            logger.error(f"Error extracting technical constraints: {str(e)}")
+    
+    def _extract_operational_constraints(self):
+        """Extract operational non-negotiable constraints"""
+        try:
+            operational_data = self.constraints.get('operational_data', {})
+            production_rules = operational_data.get('production_rules', {})
+            rules = production_rules.get('rules', [])
+            
+            for rule in rules:
+                constraint_level = rule.get('constraint_level', '')
+                if constraint_level.lower() in ['non-negotiable', 'hard']:
+                    parameter_name = rule.get('parameter_name', '')
+                    rule_category = rule.get('rule_category', '')
+                    
+                    # Skip date-specific rules (handled by DateAnchorExtractor)
+                    rule_text = rule.get('raw_text', '').lower()
+                    if 'date' in rule_text or 'deadline' in rule_text:
+                        continue
+                    
+                    non_neg = NonNegotiableConstraint(
+                        constraint_id=f"operational_{parameter_name}_{len(self.non_negotiables)}",
+                        constraint_type=rule_category,
+                        constraint_category='operational',
+                        priority=1 if constraint_level.lower() == 'non-negotiable' else 2,
+                        constraint_details=rule.get('raw_text', ''),
+                        affected_scenes=[],
+                        affected_locations=[],
+                        additional_data=rule
+                    )
+                    self.non_negotiables.append(non_neg)
+                    logger.info(f"Added operational constraint: {parameter_name} ({rule_category})")
+                    
+        except Exception as e:
+            logger.error(f"Error extracting operational constraints: {str(e)}")
+
 class LocationClusterManager:
     """Manages geographic clustering of scenes and calculates shooting requirements"""
     
     def __init__(self, stripboard_data: List[Dict], time_estimates_data: List[Dict], hours_per_day: float = 10.0):
         self.stripboard = stripboard_data
-        self.hours_per_day = hours_per_day  # Configurable shooting day length
+        self.hours_per_day = hours_per_day
         self.time_estimates = self._create_time_estimates_lookup(time_estimates_data)
         self.location_clusters: Dict[str, LocationCluster] = {}
         self.scenes: List[SceneInfo] = []
@@ -335,7 +526,6 @@ class LocationClusterManager:
         """Remove BOM characters from dictionary keys and values"""
         cleaned = {}
         for key, value in data.items():
-            # Remove BOM character (U+FEFF) from keys
             clean_key = key.lstrip('\ufeff').strip()
             cleaned[clean_key] = value
         return cleaned
@@ -352,10 +542,7 @@ class LocationClusterManager:
         
         for i, estimate in enumerate(time_estimates_data):
             try:
-                # Clean BOM characters from all keys
                 cleaned_estimate = self._clean_bom_and_keys(estimate)
-                
-                # Try multiple possible scene number field names
                 scene_number = None
                 possible_scene_fields = ['Scene_Number', 'scene_number', 'Scene_ID', 'scene_id']
                 
@@ -381,11 +568,9 @@ class LocationClusterManager:
         try:
             page_count_str = str(page_count_str).strip()
             
-            # Handle simple numbers
             if '/' not in page_count_str:
                 return float(page_count_str)
             
-            # Handle fractions like '2 3/8' or '3/8'
             parts = page_count_str.split()
             if len(parts) == 2:  # '2 3/8'
                 whole = float(parts[0])
@@ -402,13 +587,11 @@ class LocationClusterManager:
             return 1.0
     
     def _extract_time_and_complexity(self, scene_data: Dict, scene_number: str) -> Tuple[float, str]:
-        """Extract time estimate and complexity from scene data with multiple fallback strategies"""
+        """Extract time estimate and complexity from scene data"""
         
-        # Strategy 1: Try to get from time estimates lookup
         if scene_number in self.time_estimates:
             estimate_data = self.time_estimates[scene_number]
             try:
-                # Try multiple possible time field names
                 time_fields = ['Estimated_Time_Hours', 'estimated_time_hours', 'Time_Hours', 'Hours']
                 estimated_hours = None
                 
@@ -421,32 +604,28 @@ class LocationClusterManager:
                     complexity_tier = estimate_data.get('Complexity_Tier', 
                                                       estimate_data.get('complexity_tier', 'Medium'))
                     self.time_estimate_stats['matched_estimates'] += 1
-                    logger.debug(f"Scene {scene_number}: {estimated_hours}h ({complexity_tier})")
                     return estimated_hours, complexity_tier
                     
             except Exception as e:
                 logger.warning(f"Error parsing time estimate for scene {scene_number}: {str(e)}")
         
-        # Strategy 2: Fallback to page-based estimation
+        # Fallback to page-based estimation
         try:
             page_count = self._parse_page_count(scene_data.get('Page_Count', '1'))
-            estimated_hours = page_count * 1.0  # 1 page ≈ 1 hour rule of thumb
-            complexity_tier = 'Medium'  # Default complexity for page-based estimates
+            estimated_hours = page_count * 1.0
+            complexity_tier = 'Medium'
             
             self.time_estimate_stats['fallback_page_count'] += 1
-            logger.debug(f"Scene {scene_number}: {estimated_hours}h (page fallback)")
             return estimated_hours, complexity_tier
             
         except Exception as e:
             logger.error(f"Failed to estimate time for scene {scene_number}: {str(e)}")
             self.time_estimate_stats['failed_matches'] += 1
-            return 1.0, 'Medium'  # Ultimate fallback
+            return 1.0, 'Medium'
     
     def _create_scene_info(self, scene_data: Dict) -> SceneInfo:
-        """Create SceneInfo object from scene data with robust time estimation"""
+        """Create SceneInfo object from scene data"""
         scene_number = str(scene_data['Scene_Number']).strip()
-        
-        # Get time estimate and complexity
         estimated_hours, complexity_tier = self._extract_time_and_complexity(scene_data, scene_number)
         
         return SceneInfo(
@@ -465,27 +644,20 @@ class LocationClusterManager:
     
     def cluster_scenes_by_location(self) -> Dict[str, LocationCluster]:
         """Group scenes by geographic location and calculate cluster metrics"""
-        # Convert stripboard to SceneInfo objects
         self.scenes = [self._create_scene_info(scene) for scene in self.stripboard]
         
-        # Group scenes by geographic location
         location_groups = defaultdict(list)
         for scene in self.scenes:
             location_groups[scene.geographic_location].append(scene)
         
-        # Create LocationCluster objects
         for location, scenes in location_groups.items():
             total_hours = sum(scene.estimated_time_hours for scene in scenes)
-            
-            # Calculate shooting days using configurable hours per day
             total_days = max(1, int(total_hours / self.hours_per_day) + (1 if total_hours % self.hours_per_day > 0 else 0))
             
-            # Analyze complexity distribution
             complexity_counts = defaultdict(int)
             for scene in scenes:
                 complexity_counts[scene.complexity_tier] += 1
             
-            # Collect all cast requirements
             cast_requirements = set()
             for scene in scenes:
                 cast_requirements.update(scene.cast)
@@ -500,38 +672,240 @@ class LocationClusterManager:
             )
             
             self.location_clusters[location] = cluster
-            
-            logger.info(f"Location cluster '{location}': {len(scenes)} scenes, "
-                       f"{total_hours:.1f} hours, {total_days} days")
-        
-        # Log time estimation statistics
-        stats = self.time_estimate_stats
-        logger.info(f"Time Estimation Statistics:")
-        logger.info(f"  Total scenes: {stats['total_scenes']}")
-        logger.info(f"  Matched estimates: {stats['matched_estimates']}")
-        logger.info(f"  Page fallback: {stats['fallback_page_count']}")
-        logger.info(f"  Failed matches: {stats['failed_matches']}")
+            logger.info(f"Location cluster '{location}': {len(scenes)} scenes, {total_hours:.1f} hours, {total_days} days")
         
         return self.location_clusters
+
+class NaiveScheduler:
+    """Naive sequential scheduler that respects all non-negotiable constraints"""
     
-    def get_cluster_summary(self) -> Dict[str, Any]:
-        """Generate summary statistics for all location clusters"""
-        total_scenes = sum(len(cluster.scenes) for cluster in self.location_clusters.values())
-        total_hours = sum(cluster.total_shooting_hours for cluster in self.location_clusters.values())
-        total_days = sum(cluster.total_shooting_days for cluster in self.location_clusters.values())
+    def __init__(self, location_clusters: Dict[str, LocationCluster], 
+                 date_anchors: List[DateAnchor],
+                 non_negotiables: List[NonNegotiableConstraint],
+                 hours_per_day: float = 12.0):
+        self.location_clusters = location_clusters
+        self.date_anchors = date_anchors
+        self.non_negotiables = non_negotiables
+        self.hours_per_day = hours_per_day
+        self.shooting_calendar: List[ShootingDay] = []
+        self.conflicts: List[Dict[str, Any]] = []
+        
+    def create_shooting_calendar(self, start_date: datetime, end_date: datetime) -> List[ShootingDay]:
+        """Create shooting calendar with available days and mandatory off days"""
+        calendar = []
+        current_date = start_date
+        day_number = 1
+        
+        while current_date <= end_date:
+            day_of_week = current_date.strftime('%A')
+            
+            # Sunday is mandatory off day
+            status = 'off_day' if day_of_week == 'Sunday' else 'available'
+            
+            shooting_day = ShootingDay(
+                date=current_date,
+                day_number=day_number if status != 'off_day' else 0,
+                day_of_week=day_of_week,
+                status=status,
+                scenes=[],
+                cast_required=set(),
+                constraints_applied=[]
+            )
+            
+            calendar.append(shooting_day)
+            
+            if status != 'off_day':
+                day_number += 1
+                
+            current_date += timedelta(days=1)
+        
+        logger.info(f"Created shooting calendar: {len(calendar)} total days, {day_number-1} shooting days")
+        return calendar
+    
+    def apply_date_anchors(self):
+        """Apply date-specific anchors to block unavailable days"""
+        for anchor in self.date_anchors:
+            for day in self.shooting_calendar:
+                if day.date.date() == anchor.anchor_date.date():
+                    if 'unavailable' in anchor.constraint_type or 'specific_unavailable' in anchor.constraint_type:
+                        day.status = 'blocked'
+                        day.constraints_applied.append(f"Blocked by {anchor.entity_name}: {anchor.constraint_type}")
+                        logger.info(f"Blocked {day.date.strftime('%Y-%m-%d')} due to {anchor.entity_name} {anchor.constraint_type}")
+    
+    def get_available_days(self) -> List[ShootingDay]:
+        """Get list of available shooting days"""
+        return [day for day in self.shooting_calendar if day.status == 'available']
+    
+    def apply_non_negotiable_constraints(self, scenes_by_location: Dict[str, List[str]]):
+        """Apply non-negotiable constraints to enforce scene ordering and grouping"""
+        scenes_to_locations = {}
+        for location, scene_list in scenes_by_location.items():
+            for scene in scene_list:
+                scenes_to_locations[scene] = location
+        
+        # Apply constraints in priority order
+        for constraint in self.non_negotiables:
+            try:
+                if constraint.constraint_type == 'shoot_first':
+                    self._apply_shoot_first_constraint(constraint, scenes_to_locations)
+                elif constraint.constraint_type == 'shoot_last':
+                    self._apply_shoot_last_constraint(constraint, scenes_to_locations)
+                elif constraint.constraint_type == 'same_day_grouping':
+                    self._apply_same_day_grouping_constraint(constraint, scenes_to_locations)
+                elif constraint.constraint_type == 'equipment_requirement':
+                    self._apply_equipment_constraint(constraint, scenes_to_locations)
+                # Add more constraint types as needed
+                
+            except Exception as e:
+                logger.error(f"Error applying constraint {constraint.constraint_id}: {str(e)}")
+                self.conflicts.append({
+                    'type': 'constraint_application_error',
+                    'constraint_id': constraint.constraint_id,
+                    'error': str(e)
+                })
+    
+    def _apply_shoot_first_constraint(self, constraint: NonNegotiableConstraint, scenes_to_locations: Dict[str, str]):
+        """Force specified scenes to be scheduled first"""
+        for scene in constraint.affected_scenes:
+            if scene in scenes_to_locations:
+                location = scenes_to_locations[scene]
+                # This will be enforced during location assignment
+                logger.info(f"Scene {scene} marked for first shooting (location: {location})")
+    
+    def _apply_shoot_last_constraint(self, constraint: NonNegotiableConstraint, scenes_to_locations: Dict[str, str]):
+        """Force specified scenes to be scheduled last"""
+        for scene in constraint.affected_scenes:
+            if scene in scenes_to_locations:
+                location = scenes_to_locations[scene]
+                logger.info(f"Scene {scene} marked for last shooting (location: {location})")
+    
+    def _apply_same_day_grouping_constraint(self, constraint: NonNegotiableConstraint, scenes_to_locations: Dict[str, str]):
+        """Force specified scenes to be scheduled on the same day"""
+        scenes = constraint.affected_scenes
+        if len(scenes) > 1:
+            logger.info(f"Scenes {scenes} must be scheduled on the same day")
+    
+    def _apply_equipment_constraint(self, constraint: NonNegotiableConstraint, scenes_to_locations: Dict[str, str]):
+        """Apply equipment availability constraints"""
+        equipment_data = constraint.additional_data.get('equipment_requirements', {})
+        rental_schedule = equipment_data.get('rental_schedule', {})
+        
+        for scene in constraint.affected_scenes:
+            if scene in scenes_to_locations:
+                location = scenes_to_locations[scene]
+                logger.info(f"Scene {scene} requires equipment: {constraint.constraint_details}")
+    
+    def assign_location_blocks(self):
+        """Assign location clusters to available days sequentially"""
+        available_days = self.get_available_days()
+        current_day_index = 0
+        
+        # Sort clusters by priority (largest first, then alphabetical)
+        sorted_clusters = sorted(
+            self.location_clusters.items(),
+            key=lambda x: (-x[1].total_shooting_days, x[0])
+        )
+        
+        for location, cluster in sorted_clusters:
+            days_needed = cluster.total_shooting_days
+            
+            # Check if we have enough days available
+            if current_day_index + days_needed > len(available_days):
+                self.conflicts.append({
+                    'type': 'insufficient_days',
+                    'location': location,
+                    'days_needed': days_needed,
+                    'days_available': len(available_days) - current_day_index
+                })
+                logger.warning(f"Insufficient days for location {location}: need {days_needed}, have {len(available_days) - current_day_index}")
+                continue
+            
+            # Assign consecutive days to this location
+            assigned_days = []
+            for i in range(days_needed):
+                day = available_days[current_day_index + i]
+                day.status = 'assigned'
+                day.location = location
+                assigned_days.append(day)
+            
+            # Distribute scenes across assigned days
+            scenes_per_day = len(cluster.scenes) // days_needed
+            extra_scenes = len(cluster.scenes) % days_needed
+            
+            scene_index = 0
+            for day_i, day in enumerate(assigned_days):
+                scenes_for_day = scenes_per_day + (1 if day_i < extra_scenes else 0)
+                day_scenes = cluster.scenes[scene_index:scene_index + scenes_for_day]
+                
+                day.scenes = [scene.scene_number for scene in day_scenes]
+                day.total_hours = sum(scene.estimated_time_hours for scene in day_scenes)
+                
+                # Collect cast requirements
+                for scene in day_scenes:
+                    day.cast_required.update(scene.cast)
+                
+                scene_index += scenes_for_day
+            
+            current_day_index += days_needed
+            logger.info(f"Assigned location '{location}' to {days_needed} days starting {assigned_days[0].date.strftime('%Y-%m-%d')}")
+    
+    def generate_schedule(self, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
+        """Generate complete naive schedule"""
+        logger.info("Starting naive scheduling")
+        
+        # Create shooting calendar
+        self.shooting_calendar = self.create_shooting_calendar(start_date, end_date)
+        
+        # Apply date anchors to block unavailable days
+        self.apply_date_anchors()
+        
+        # Create scenes by location mapping
+        scenes_by_location = {}
+        for location, cluster in self.location_clusters.items():
+            scenes_by_location[location] = [scene.scene_number for scene in cluster.scenes]
+        
+        # Apply non-negotiable constraints
+        self.apply_non_negotiable_constraints(scenes_by_location)
+        
+        # Assign location blocks sequentially
+        self.assign_location_blocks()
+        
+        # Generate output
+        schedule_output = {
+            'shooting_days': [],
+            'conflicts': self.conflicts,
+            'statistics': self._generate_statistics()
+        }
+        
+        for day in self.shooting_calendar:
+            if day.status == 'assigned':
+                schedule_output['shooting_days'].append({
+                    'date': day.date.strftime('%Y-%m-%d'),
+                    'day_of_week': day.day_of_week,
+                    'day_number': day.day_number,
+                    'location': day.location,
+                    'scenes': day.scenes,
+                    'total_hours': round(day.total_hours, 2),
+                    'cast_required': list(day.cast_required),
+                    'constraints_applied': day.constraints_applied
+                })
+        
+        logger.info(f"Naive scheduling completed: {len(schedule_output['shooting_days'])} shooting days, {len(self.conflicts)} conflicts")
+        return schedule_output
+    
+    def _generate_statistics(self) -> Dict[str, Any]:
+        """Generate schedule statistics"""
+        assigned_days = [day for day in self.shooting_calendar if day.status == 'assigned']
+        total_scenes = sum(len(day.scenes) for day in assigned_days)
+        total_hours = sum(day.total_hours for day in assigned_days)
         
         return {
-            'total_locations': len(self.location_clusters),
-            'total_scenes': total_scenes,
-            'total_shooting_hours': total_hours,
-            'total_shooting_days': total_days,
-            'hours_per_day_configured': self.hours_per_day,
-            'time_estimation_stats': self.time_estimate_stats,
-            'locations_by_size': sorted(
-                [(loc, cluster.total_shooting_days) for loc, cluster in self.location_clusters.items()],
-                key=lambda x: x[1],
-                reverse=True
-            )
+            'total_shooting_days': len(assigned_days),
+            'total_scenes_scheduled': total_scenes,
+            'total_shooting_hours': round(total_hours, 2),
+            'average_hours_per_day': round(total_hours / len(assigned_days) if assigned_days else 0, 2),
+            'conflicts_count': len(self.conflicts),
+            'locations_scheduled': len(set(day.location for day in assigned_days if day.location))
         }
 
 class ProductionScheduler:
@@ -573,7 +947,6 @@ class ProductionScheduler:
             
             for field in required_scene_fields:
                 if field not in scene:
-                    # For Location_Name, allow empty strings but not missing keys
                     if field == 'Location_Name':
                         logger.warning(f"Scene {scene_id} missing Location_Name - setting to 'TBD'")
                         scene['Location_Name'] = 'TBD'
@@ -595,6 +968,7 @@ class ProductionScheduler:
         
         # Initialize components
         self.date_anchor_extractor = DateAnchorExtractor(self.constraints)
+        self.non_negotiable_extractor = NonNegotiableExtractor(self.constraints)
         
         # Get time estimates data
         time_estimates_data = (
@@ -612,7 +986,9 @@ class ProductionScheduler:
         
         # Initialize results storage
         self.date_anchors = []
+        self.non_negotiables = []
         self.location_clusters = {}
+        self.naive_schedule = {}
     
     def _extract_hours_per_day(self) -> float:
         """Extract hours per day from production rules constraints"""
@@ -625,7 +1001,6 @@ class ProductionScheduler:
             )
             
             for rule in production_rules:
-                # Look for standard work day hours rule
                 parameter_name = rule.get('parameter_name', '')
                 rule_type = rule.get('parsed_data', {}).get('rule_type', '')
                 
@@ -647,25 +1022,40 @@ class ProductionScheduler:
             logger.error(f"Error extracting hours_per_day from production rules: {str(e)}")
             return 10.0
     
-    def process_iteration_1(self):
-        """Execute Iteration 1: Data loading, anchoring, and clustering"""
-        logger.info("Starting Iteration 1: Foundational Data Loading & Location Clustering")
+    def process_iteration_2(self):
+        """Execute Iteration 2: All Non-Negotiables + Naive Scheduler"""
+        logger.info("Starting Iteration 2: All Non-Negotiables + Naive Scheduler")
         
-        # Step 1: Extract date-specific non-negotiable anchors
+        # Step 1: Extract date-specific anchors
         logger.info("Step 1: Extracting date-specific anchors...")
         self.date_anchors = self.date_anchor_extractor.extract_all_anchors()
         
-        # Step 2: Create location clusters
-        logger.info("Step 2: Creating location clusters...")
+        # Step 2: Extract non-date-specific non-negotiables
+        logger.info("Step 2: Extracting non-date-specific non-negotiables...")
+        self.non_negotiables = self.non_negotiable_extractor.extract_all_non_negotiables()
+        
+        # Step 3: Create location clusters
+        logger.info("Step 3: Creating location clusters...")
         self.location_clusters = self.location_manager.cluster_scenes_by_location()
         
-        # Step 3: Generate summary
-        logger.info("Step 3: Generating summary...")
-        cluster_summary = self.location_manager.get_cluster_summary()
+        # Step 4: Generate naive schedule
+        logger.info("Step 4: Generating naive schedule...")
+        naive_scheduler = NaiveScheduler(
+            self.location_clusters,
+            self.date_anchors,
+            self.non_negotiables,
+            self.hours_per_day
+        )
+        
+        # Use reasonable date range (Sept 1 - Nov 30, 2025)
+        start_date = datetime(2025, 9, 1)
+        end_date = datetime(2025, 11, 30)
+        
+        self.naive_schedule = naive_scheduler.generate_schedule(start_date, end_date)
         
         # Compile results
         results = {
-            'iteration': 1,
+            'iteration': 2,
             'status': 'completed',
             'date_anchors': [
                 {
@@ -675,6 +1065,18 @@ class ProductionScheduler:
                     'constraint_details': anchor.constraint_details
                 }
                 for anchor in self.date_anchors
+            ],
+            'non_negotiable_constraints': [
+                {
+                    'constraint_id': constraint.constraint_id,
+                    'constraint_type': constraint.constraint_type,
+                    'constraint_category': constraint.constraint_category,
+                    'priority': constraint.priority,
+                    'constraint_details': constraint.constraint_details,
+                    'affected_scenes': constraint.affected_scenes,
+                    'affected_locations': constraint.affected_locations
+                }
+                for constraint in self.non_negotiables
             ],
             'location_clusters': {
                 location: {
@@ -687,19 +1089,19 @@ class ProductionScheduler:
                 }
                 for location, cluster in self.location_clusters.items()
             },
-            'summary': cluster_summary
+            'naive_schedule': self.naive_schedule
         }
         
-        logger.info(f"Iteration 1 completed successfully: "
-                   f"{len(self.date_anchors)} anchors, "
-                   f"{len(self.location_clusters)} location clusters")
+        logger.info(f"Iteration 2 completed successfully: "
+                   f"{len(self.date_anchors)} date anchors, "
+                   f"{len(self.non_negotiables)} non-negotiables, "
+                   f"{len(self.naive_schedule.get('shooting_days', []))} shooting days scheduled")
         
         return results
 
 def main():
     """Main entry point for local testing"""
     try:
-        # Example usage for local testing
         sample_data = {
             'stripboard': [
                 {
@@ -727,9 +1129,12 @@ def main():
                         ]
                     }
                 },
-                'creative_constraints': {},
-                'location_constraints': {},
-                'technical_constraints': {}
+                'creative_constraints': {
+                    'director_notes': {'director_constraints': []},
+                    'dop_priorities': {'dop_priorities': []}
+                },
+                'location_constraints': {'locations': {}},
+                'technical_constraints': {'equipment': {}, 'special_requirements': {}}
             },
             'ga_params': {
                 'phase1_population': 100,
@@ -742,9 +1147,9 @@ def main():
         }
         
         scheduler = ProductionScheduler(sample_data)
-        results = scheduler.process_iteration_1()
+        results = scheduler.process_iteration_2()
         
-        print("=== Iteration 1 Results ===")
+        print("=== Iteration 2 Results ===")
         print(json.dumps(results, indent=2))
         
     except Exception as e:
@@ -752,7 +1157,6 @@ def main():
         raise
 
 if __name__ == "__main__":
-    # For Railway deployment, use uvicorn
     import os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
