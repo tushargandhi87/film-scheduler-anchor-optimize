@@ -508,7 +508,7 @@ async def health_check():
 async def create_schedule(request: Request):
     """
     Main endpoint to process film production scheduling
-    Expects JSON array matching the http_request.schema.json structure
+    Expects JSON object with optional hours_per_day configuration
     """
     start_time = datetime.now()
     
@@ -518,12 +518,30 @@ async def create_schedule(request: Request):
         
         logger.info("Received scheduling request")
         logger.info(f"Raw body type: {type(body)}")
-        logger.info(f"Raw body length (if list): {len(body) if isinstance(body, list) else 'N/A - not a list'}")
-        logger.info(f"Raw body keys (if dict): {list(body.keys()) if isinstance(body, dict) else 'N/A - not a dict'}")
-        logger.info(f"First 200 chars of body: {str(body)[:200]}...")
         
-        # Initialize scheduler with the input data
-        scheduler = ProductionScheduler(body)
+        # Extract configuration parameters
+        hours_per_day = 10.0  # Default value
+        
+        # Check if hours_per_day is provided in the request
+        if isinstance(body, dict):
+            # If body is a dict, check for hours_per_day at top level
+            hours_per_day = body.get('hours_per_day', 10.0)
+            
+            # Also check in ga_params if it exists
+            if 'ga_params' in body and isinstance(body['ga_params'], dict):
+                hours_per_day = body['ga_params'].get('hours_per_day', hours_per_day)
+        elif isinstance(body, list) and len(body) > 0 and isinstance(body[0], dict):
+            # If body is a list, check the first object
+            hours_per_day = body[0].get('hours_per_day', 10.0)
+            
+            # Also check in ga_params if it exists
+            if 'ga_params' in body[0] and isinstance(body[0]['ga_params'], dict):
+                hours_per_day = body[0]['ga_params'].get('hours_per_day', hours_per_day)
+        
+        logger.info(f"Using hours_per_day: {hours_per_day}")
+        
+        # Initialize scheduler with the input data and configuration
+        scheduler = ProductionScheduler(body, hours_per_day=hours_per_day)
         
         # Process Iteration 1
         results = scheduler.process_iteration_1()
