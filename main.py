@@ -1,5 +1,5 @@
 """
-Film Production Scheduling Optimizer - Iteration 2
+Film Production Scheduling Optimizer - Iteration 2 (FIXED)
 All Non-Negotiables + Naive Scheduler
 
 This iteration implements:
@@ -8,6 +8,8 @@ This iteration implements:
 3. Naive sequential scheduler with full constraint compliance
 4. Day-by-day shooting schedule generation
 5. FastAPI web service for deployment on Railway
+
+FIX: Location availability windows are now properly enforced during assignment
 """
 
 import json
@@ -89,7 +91,7 @@ class ShootingDay:
 app = FastAPI(
     title="Film Production Scheduling Optimizer",
     description="AI-powered film production scheduling with hierarchical constraint optimization",
-    version="2.0.0"
+    version="2.0.1"
 )
 
 class ScheduleResponse(BaseModel):
@@ -107,7 +109,8 @@ async def root():
         "message": "Film Production Scheduling Optimizer",
         "status": "active",
         "iteration": 2,
-        "description": "All Non-Negotiables + Naive Scheduler"
+        "version": "2.0.1",
+        "description": "All Non-Negotiables + Naive Scheduler (Location Window Fix)"
     }
 
 @app.get("/health")
@@ -117,7 +120,8 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "service": "film-scheduler",
-        "iteration": 2
+        "iteration": 2,
+        "version": "2.0.1"
     }
 
 @app.post("/schedule", response_model=ScheduleResponse)
@@ -795,6 +799,30 @@ class NaiveScheduler:
                 location = scenes_to_locations[scene]
                 logger.info(f"Scene {scene} requires equipment: {constraint.constraint_details}")
     
+    def _get_location_availability_window(self, location_name: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+        """
+        Get the availability window for a specific location from date anchors.
+        Returns (start_date, end_date) tuple or (None, None) if no window constraint exists.
+        """
+        start_date = None
+        end_date = None
+        
+        for anchor in self.date_anchors:
+            # Check if this anchor is for the current location
+            if anchor.entity_name == location_name:
+                # Handle different anchor types
+                if 'location_availability' in anchor.constraint_type or 'location_window' in anchor.constraint_type:
+                    if 'window_start' in anchor.constraint_type:
+                        start_date = anchor.anchor_date
+                    elif 'window_end' in anchor.constraint_type:
+                        end_date = anchor.anchor_date
+                    elif 'availability' in anchor.constraint_type:
+                        # Single day availability
+                        start_date = anchor.anchor_date
+                        end_date = anchor.anchor_date
+        
+        return start_date, end_date
+    
     def assign_location_blocks(self):
         """Assign location clusters to available days sequentially"""
         available_days = self.get_available_days()
@@ -809,21 +837,53 @@ class NaiveScheduler:
         for location, cluster in sorted_clusters:
             days_needed = cluster.total_shooting_days
             
-            # Check if we have enough days available
-            if current_day_index + days_needed > len(available_days):
-                self.conflicts.append({
-                    'type': 'insufficient_days',
-                    'location': location,
-                    'days_needed': days_needed,
-                    'days_available': len(available_days) - current_day_index
-                })
-                logger.warning(f"Insufficient days for location {location}: need {days_needed}, have {len(available_days) - current_day_index}")
-                continue
+            # CRITICAL FIX: Check for location availability window constraints
+            start_window, end_window = self._get_location_availability_window(location)
             
-            # Assign consecutive days to this location
+            # Filter available days to only those within the location's window
+            if start_window and end_window:
+                logger.info(f"Location '{location}' has availability window: {start_window.date()} to {end_window.date()}")
+                
+                # Filter available days to only those within the window
+                location_valid_days = [
+                    day for day in available_days[current_day_index:]
+                    if start_window.date() <= day.date.date() <= end_window.date()
+                ]
+                
+                if len(location_valid_days) < days_needed:
+                    self.conflicts.append({
+                        'type': 'location_window_violation',
+                        'location': location,
+                        'days_needed': days_needed,
+                        'days_available_in_window': len(location_valid_days),
+                        'window_start': start_window.date().isoformat(),
+                        'window_end': end_window.date().isoformat(),
+                        'reason': f'Location requires {days_needed} days but only {len(location_valid_days)} available days exist within its availability window'
+                    })
+                    logger.warning(f"Cannot schedule location '{location}': needs {days_needed} days, but only {len(location_valid_days)} available within window {start_window.date()} to {end_window.date()}")
+                    continue
+                
+                # Use the filtered days for this location
+                days_to_assign = location_valid_days[:days_needed]
+            else:
+                # No window constraint - use normal sequential assignment
+                remaining_days = available_days[current_day_index:]
+                
+                if len(remaining_days) < days_needed:
+                    self.conflicts.append({
+                        'type': 'insufficient_days',
+                        'location': location,
+                        'days_needed': days_needed,
+                        'days_available': len(remaining_days)
+                    })
+                    logger.warning(f"Insufficient days for location {location}: need {days_needed}, have {len(remaining_days)}")
+                    continue
+                
+                days_to_assign = remaining_days[:days_needed]
+            
+            # Assign the filtered/validated days to this location
             assigned_days = []
-            for i in range(days_needed):
-                day = available_days[current_day_index + i]
+            for day in days_to_assign:
                 day.status = 'assigned'
                 day.location = location
                 assigned_days.append(day)
@@ -846,7 +906,10 @@ class NaiveScheduler:
                 
                 scene_index += scenes_for_day
             
-            current_day_index += days_needed
+            # Only advance current_day_index if no window constraint (sequential assignment)
+            if not (start_window and end_window):
+                current_day_index += days_needed
+            
             logger.info(f"Assigned location '{location}' to {days_needed} days starting {assigned_days[0].date.strftime('%Y-%m-%d')}")
     
     def generate_schedule(self, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
