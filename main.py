@@ -91,7 +91,7 @@ class ShootingDay:
 app = FastAPI(
     title="Film Production Scheduling Optimizer",
     description="AI-powered film production scheduling with hierarchical constraint optimization",
-    version="2.0.1"
+    version="2.0.2"
 )
 
 class ScheduleResponse(BaseModel):
@@ -109,8 +109,8 @@ async def root():
         "message": "Film Production Scheduling Optimizer",
         "status": "active",
         "iteration": 2,
-        "version": "2.0.1",
-        "description": "All Non-Negotiables + Naive Scheduler (Location Window Fix)"
+        "version": "2.0.2",
+        "description": "All Non-Negotiables + Naive Scheduler (Geographic Location Fix)"
     }
 
 @app.get("/health")
@@ -121,7 +121,7 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "service": "film-scheduler",
         "iteration": 2,
-        "version": "2.0.1"
+        "version": "2.0.2"
     }
 
 @app.post("/schedule", response_model=ScheduleResponse)
@@ -204,9 +204,38 @@ async def global_exception_handler(request: Request, exc: Exception):
 class DateAnchorExtractor:
     """Extracts date-specific non-negotiable constraints"""
     
-    def __init__(self, constraints_data: Dict):
+    def __init__(self, constraints_data: Dict, stripboard_data: List[Dict]):
         self.constraints = constraints_data
+        self.stripboard = stripboard_data
         self.date_anchors: List[DateAnchor] = []
+        self.location_name_mapping = self._create_location_mapping()
+    
+    def _create_location_mapping(self) -> Dict[str, str]:
+        """
+        Create mapping from script location names to geographic locations.
+        Returns dict: {script_location_name: geographic_location}
+        """
+        mapping = {}
+        
+        for scene in self.stripboard:
+            script_location = scene.get('Location_Name', '').strip()
+            geographic_location = scene.get('Geographic_Location', '').strip()
+            
+            if script_location and geographic_location:
+                # Normalize to uppercase for matching (constraints use uppercase keys)
+                script_location_upper = script_location.upper()
+                
+                # Store the mapping - use geographic_location as the canonical name
+                if script_location_upper not in mapping:
+                    mapping[script_location_upper] = geographic_location
+                elif mapping[script_location_upper] != geographic_location:
+                    logger.warning(
+                        f"Script location '{script_location}' maps to multiple geographic locations: "
+                        f"'{mapping[script_location_upper]}' and '{geographic_location}'"
+                    )
+        
+        logger.info(f"Created location mapping for {len(mapping)} script locations")
+        return mapping
     
     def extract_all_anchors(self) -> List[DateAnchor]:
         """Extract all date-specific non-negotiable constraints"""
@@ -263,6 +292,17 @@ class DateAnchorExtractor:
             for location_id, location_data in locations.items():
                 constraints = location_data.get('constraints', [])
                 
+                # Map script location name to geographic location
+                location_id_upper = location_id.upper()
+                geographic_location = self.location_name_mapping.get(location_id_upper)
+                
+                if not geographic_location:
+                    logger.warning(
+                        f"Script location '{location_id}' not found in stripboard mapping. "
+                        f"Skipping date constraints for this location."
+                    )
+                    continue
+                
                 for constraint in constraints:
                     constraint_level = constraint.get('constraint_level', '')
                     constraint_type = constraint.get('constraint_type', '')
@@ -280,37 +320,37 @@ class DateAnchorExtractor:
                                 start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
                                 end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
                                 
-                                # Create anchor for location availability window
+                                # Create anchor for location availability window using GEOGRAPHIC LOCATION
                                 if start_date == end_date:
                                     # Single day availability
                                     anchor = DateAnchor(
                                         constraint_type=f'location_availability_{constraint_level.lower()}',
-                                        entity_name=location_id,
+                                        entity_name=geographic_location,
                                         anchor_date=start_date,
                                         constraint_details=f"Available on {start_date_str} only - {constraint.get('original_text', '')}",
                                         affected_scenes=[]
                                     )
                                     self.date_anchors.append(anchor)
-                                    logger.info(f"Added location anchor: {location_id} available on {start_date_str}")
+                                    logger.info(f"Added location anchor: {geographic_location} (script: {location_id}) available on {start_date_str}")
                                 else:
                                     # Multi-day availability window - create anchor for start and end
                                     start_anchor = DateAnchor(
                                         constraint_type=f'location_window_start_{constraint_level.lower()}',
-                                        entity_name=location_id,
+                                        entity_name=geographic_location,
                                         anchor_date=start_date,
                                         constraint_details=f"Available from {start_date_str} to {end_date_str} - {constraint.get('original_text', '')}",
                                         affected_scenes=[]
                                     )
                                     end_anchor = DateAnchor(
                                         constraint_type=f'location_window_end_{constraint_level.lower()}',
-                                        entity_name=location_id,
+                                        entity_name=geographic_location,
                                         anchor_date=end_date,
                                         constraint_details=f"Available from {start_date_str} to {end_date_str} - {constraint.get('original_text', '')}",
                                         affected_scenes=[]
                                     )
                                     self.date_anchors.append(start_anchor)
                                     self.date_anchors.append(end_anchor)
-                                    logger.info(f"Added location window anchors: {location_id} available {start_date_str} to {end_date_str}")
+                                    logger.info(f"Added location window anchors: {geographic_location} (script: {location_id}) available {start_date_str} to {end_date_str}")
                                     
                             except ValueError as e:
                                 logger.warning(f"Invalid date format for location {location_id}: {start_date_str} - {end_date_str}")
@@ -1030,7 +1070,7 @@ class ProductionScheduler:
         logger.info(f"Using hours_per_day: {self.hours_per_day}")
         
         # Initialize components
-        self.date_anchor_extractor = DateAnchorExtractor(self.constraints)
+        self.date_anchor_extractor = DateAnchorExtractor(self.constraints, self.stripboard)
         self.non_negotiable_extractor = NonNegotiableExtractor(self.constraints)
         
         # Get time estimates data
